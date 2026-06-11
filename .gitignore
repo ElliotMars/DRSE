@@ -4,9 +4,12 @@
 *.pyc
 **/__pycache__/
 checkpoints/
-results/
-results1/
+result/
 imgs/*
 *.pdf
 *.out
 *.csv
+log/
+scripts/hp_search
+scripts/dataset_horizon
+scripts/plot

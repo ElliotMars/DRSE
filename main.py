@@ -109,6 +109,7 @@ def parse_args():
     parser.add_argument('--activation', type=str, default='gelu', help='activation')
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
+    parser.add_argument('--skip_test', action='store_true', default=False, help='skip test stage after training')
     parser.add_argument('--mix', action='store_false', help='use mix attention in generative decoder', default=True)
     parser.add_argument('--cols', type=str, nargs='+', help='certain cols from the data files as the input features')
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
@@ -117,6 +118,10 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
     parser.add_argument('--learning_rate', type=float, default=0.003, help='optimizer learning rate')
+    parser.add_argument('--learning_rate_expert', type=float, default=None,
+                        help='optimizer learning rate for expert parameters')
+    parser.add_argument('--learning_rate_router', type=float, default=None,
+                        help='optimizer learning rate for router parameters')
     parser.add_argument('--learning_rate_w', type=float, default=0.001, help='optimizer learning rate')
     parser.add_argument('--learning_rate_bias', type=float, default=0.001, help='optimizer learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='optimizer learning rate')
@@ -150,6 +155,12 @@ def parse_args():
 
     parser.add_argument('--test_bsz', type=int, default=1)
     parser.add_argument('--n_inner', type=int, default=1)
+    parser.add_argument('--num_experts', type=int, default=4, help='number of experts for multi-expert OneNet variants')
+    parser.add_argument('--top_k', type=int, default=2, help='top-k experts selected by MoE router')
+    parser.add_argument('--lambda_div', type=float, default=0.05, help='weight of expert diversity loss during pretraining')
+    parser.add_argument('--tsb_alpha', type=float, default=0.5, help='EMA factor for online TSB smoothing')
+    parser.add_argument('--tsb_eps', type=float, default=1e-8, help='epsilon for online TSB projection')
+    parser.add_argument('--tsb_buffer_size', type=int, default=32, help='buffer size for online TSB reference gradient')
     parser.add_argument('--channel_cross', type=bool, default=False)
 
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
@@ -196,6 +207,16 @@ def parse_args():
     parser.add_argument('--alpha_d', type=float, default=0.003, help='spectrum filter ratio')
     parser.add_argument('--test_lr', type=float, default=0.1, help='spectrum filter ratio')
     args = parser.parse_args()
+
+    # Backward-compatible defaults:
+    # if specific lrs are not provided, both expert/router reuse learning_rate.
+    if args.learning_rate_expert is None:
+        args.learning_rate_expert = args.learning_rate
+    if args.learning_rate_router is None:
+        args.learning_rate_router = args.learning_rate
+    # Keep old training schedule behavior (adjust_learning_rate uses args.learning_rate)
+    # by mapping base learning rate to expert learning rate.
+    args.learning_rate = args.learning_rate_expert
 
     args.use_gpu = True if torch.cuda.is_available() and args.use_gpu else False
     args.test_bsz = args.batch_size if args.test_bsz == -1 else args.test_bsz
@@ -259,22 +280,43 @@ if __name__ == '__main__':
         print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
         exp.train(setting)
 
+        if args.skip_test:
+            print('>>>>>>>testing skipped : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
+            metrics.append([np.nan, np.nan, np.nan, np.nan, np.nan, np.nan])
+            mae.append(np.nan)
+            mse.append(np.nan)
+            torch.cuda.empty_cache()
+            continue
+
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
         m, mae_, mse_, p, t = exp.test(setting)
         metrics.append(m)
-        if str(args.data) == 'ECL' or str(args.data) == 'Traffic':
-            preds = [0]
-            true = [0]
-        else:
-            preds.append(p)
-            true.append(t)
+        # if str(args.data) == 'ECL' or str(args.data) == 'Traffic':
+        #     preds = [0]
+        #     true = [0]
+        # else:
+        #     preds.append(p)
+        #     true.append(t)
+        preds.append(p)
+        true.append(t)
 
         mae.append(mae_)
         mse.append(mse_)
         torch.cuda.empty_cache()
 
     # folder_path = './results/' + setting + '/'
-    folder_path = './result/results{}/{}/'.format(args.n_inner, setting)
+    result_root = './result/'
+    if not os.path.exists(result_root):
+        os.makedirs(result_root)
+
+    next_idx = 1
+    for name in os.listdir(result_root):
+        if name.startswith('results'):
+            suffix = name[len('results'):]
+            if suffix.isdigit():
+                next_idx = max(next_idx, int(suffix) + 1)
+
+    folder_path = os.path.join(result_root, 'results{}'.format(next_idx), setting) + '/'
     if not os.path.exists(folder_path):
         os.makedirs(folder_path)
     np.save(folder_path + 'metrics.npy', np.array(metrics))

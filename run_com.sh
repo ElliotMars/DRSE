@@ -36,18 +36,19 @@ unset _CONDA_SH
 
 conda activate /opt/data/private/envs/Online
 
-## M
 online_learning='full'
 i=1
-ns=(1)
-bszs=(1)
-lens=(1 24 48)
-methods=('onenet_fsnet')
+n=1
+bsz=1
+m='onenet_fsnet'
+LOG_DIR='log/run'
+mkdir -p "$LOG_DIR"
 
-# Comma-separated GPU ids, e.g. "0,1,2,3"
-GPU_IDS_STR="${GPU_IDS:-0}"
-MAX_PER_GPU="${MAX_PER_GPU:-3}"
+# Comma-separated GPU ids. Default: 3 GPUs, 2 concurrent jobs per GPU.
+GPU_IDS_STR="${GPU_IDS:-0,1,2}"
+MAX_PER_GPU="${MAX_PER_GPU:-2}"
 IFS=',' read -r -a GPU_IDS <<< "$GPU_IDS_STR"
+echo "[CONFIG] GPU_IDS_STR=${GPU_IDS_STR} parsed_gpus=${GPU_IDS[*]} MAX_PER_GPU=${MAX_PER_GPU}"
 
 declare -a RUN_PIDS=()
 declare -A PID_GPU=()
@@ -96,6 +97,7 @@ submit_job() {
   local log="$2"
   shift 2
 
+  echo "[WAIT] gpu=$gpu log=$log"
   wait_for_gpu_slot "$gpu"
 
   CUDA_VISIBLE_DEVICES="$gpu" python -u main.py "$@" > "$log" 2>&1 &
@@ -106,48 +108,40 @@ submit_job() {
 }
 
 pick_next_gpu() {
-  local gpu="${GPU_IDS[$next_gpu_idx]}"
+  PICKED_GPU="${GPU_IDS[$next_gpu_idx]}"
   next_gpu_idx=$(((next_gpu_idx + 1) % ${#GPU_IDS[@]}))
-  echo "$gpu"
 }
 
-for n in "${ns[@]}"; do
-for bsz in "${bszs[@]}"; do
-for len in "${lens[@]}"; do
-for m in "${methods[@]}"; do
+run_job() {
+  local data="$1"
+  local pred_len="$2"
+  local lr="$3"
+  local adbfgs="$4"
+  local log="$LOG_DIR/${data}${pred_len}${online_learning}.out"
+  local gpu
+  pick_next_gpu
+  gpu="$PICKED_GPU"
 
-  gpu=$(pick_next_gpu)
-  submit_job "$gpu" "ETTh2${len}${online_learning}.out" \
-    --method "$m" --root_path ./data/ --n_inner "$n" --test_bsz "$bsz" \
-    --data ETTh2 --features M --seq_len 60 --label_len 0 --pred_len "$len" \
-    --des 'Exp' --itr "$i" --train_epochs 15 --learning_rate 1e-3 \
-    --online_learning "$online_learning" --use_adbfgs
+  if [ "$adbfgs" = "1" ]; then
+    submit_job "$gpu" "$log" \
+      --method "$m" --root_path ./data/ --n_inner "$n" --test_bsz "$bsz" \
+      --data "$data" --features M --seq_len 60 --label_len 0 --pred_len "$pred_len" \
+      --des 'Exp' --itr "$i" --train_epochs 15 --learning_rate "$lr" \
+      --online_learning "$online_learning" --use_adbfgs
+  else
+    submit_job "$gpu" "$log" \
+      --method "$m" --root_path ./data/ --n_inner "$n" --test_bsz "$bsz" \
+      --data "$data" --features M --seq_len 60 --label_len 0 --pred_len "$pred_len" \
+      --des 'Exp' --itr "$i" --train_epochs 15 --learning_rate "$lr" \
+      --online_learning "$online_learning"
+  fi
+}
 
-  gpu=$(pick_next_gpu)
-  submit_job "$gpu" "ETTm1${len}${online_learning}.out" \
-    --method "$m" --root_path ./data/ --n_inner "$n" --test_bsz "$bsz" \
-    --data ETTm1 --features M --seq_len 60 --label_len 0 --pred_len "$len" \
-    --des 'Exp' --itr "$i" --train_epochs 15 --learning_rate 1e-3 \
-    --online_learning "$online_learning"
-
-  gpu=$(pick_next_gpu)
-  submit_job "$gpu" "WTH${len}${online_learning}.out" \
-    --method "$m" --root_path ./data/ --n_inner "$n" --test_bsz "$bsz" \
-    --data WTH --features M --seq_len 60 --label_len 0 --pred_len "$len" \
-    --des 'Exp' --itr "$i" --train_epochs 15 --learning_rate 1e-3 \
-    --online_learning "$online_learning" --use_adbfgs
-
-  gpu=$(pick_next_gpu)
-  submit_job "$gpu" "ECL${len}${online_learning}.out" \
-    --method "$m" --root_path ./data/ --n_inner "$n" --test_bsz "$bsz" \
-    --data ECL --features M --seq_len 60 --label_len 0 --pred_len "$len" \
-    --des 'Exp' --itr "$i" --train_epochs 15 --learning_rate 3e-3 \
-    --online_learning "$online_learning" --use_adbfgs
-
-done
-done
-done
-done
+run_job ECL 24 3e-3 1
+run_job ECL 48 3e-3 1
+run_job ETTh2 48 1e-3 1
+run_job ETTm1 24 1e-3 0
+run_job ETTm1 48 1e-3 0
 
 wait
 echo "All runs finished."

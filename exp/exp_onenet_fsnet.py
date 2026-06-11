@@ -85,23 +85,29 @@ class net(nn.Module):
         
     
     def forward_individual(self, x, x_mark):
-        rep = self.encoder_time.encoder.forward_time(x)
+        # FSNet conv stack may fail to find a cuDNN algo on some CUDA/cuDNN combos.
+        with torch.backends.cudnn.flags(enabled=False):
+            rep = self.encoder_time.encoder.forward_time(x)
         y = self.regressor_time(rep).transpose(1, 2)
         y1 = rearrange(y, 'b t d -> b (t d)')
         
         x = torch.cat([x, x_mark], dim=-1)
-        rep2 = self.encoder(x)[:, -1]
+        with torch.backends.cudnn.flags(enabled=False):
+            rep2 = self.encoder(x)[:, -1]
         y2 = self.regressor(rep2)
     
         return y1, y2
     
     def forward_weight(self, x, x_mark, g1, g2):
-        rep = self.encoder_time.encoder.forward_time(x)
+        # FSNet conv stack may fail to find a cuDNN algo on some CUDA/cuDNN combos.
+        with torch.backends.cudnn.flags(enabled=False):
+            rep = self.encoder_time.encoder.forward_time(x)
         y = self.regressor_time(rep).transpose(1, 2)
         y1 = rearrange(y, 'b t d -> b (t d)')
         
         x = torch.cat([x, x_mark], dim=-1)
-        rep2 = self.encoder(x)[:, -1]
+        with torch.backends.cudnn.flags(enabled=False):
+            rep2 = self.encoder(x)[:, -1]
         y2 = self.regressor(rep2)
     
         return y1.detach() * g1 + y2.detach() * g2, y1, y2
@@ -516,4 +522,3 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.count += batch_y.size(0)
         self.buffer.add_data(examples = x, labels = true, logits = idx, task_labels=batch_x_mark)
         return outputs, rearrange(batch_y, 'b t d -> b (t d)')
-
