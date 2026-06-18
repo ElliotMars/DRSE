@@ -1,41 +1,5 @@
 #!/usr/bin/env bash
 
-# 环境变量相关
-export PATH=~/git-2.41.0/git:$PATH
-export PATH=/opt/data/private/ollama/bin:$PATH
-export PATH=/opt/conda/bin:$PATH
-export OLLAMA_MODELS=/opt/data/private/ollama-models/
-export OLLAMA_HOST=0.0.0.0:11434
-export HF_ENDPOINT=https://hf-mirror.com
-
-# conda相关
-# >>> conda initialize >>>
-if [ -x "/opt/conda/bin/conda" ]; then
-    _CONDA_BIN="/opt/conda/bin/conda"
-    _CONDA_SH="/opt/conda/etc/profile.d/conda.sh"
-elif [ -x "/root/miniconda3/bin/conda" ]; then
-    _CONDA_BIN="/root/miniconda3/bin/conda"
-    _CONDA_SH="/root/miniconda3/etc/profile.d/conda.sh"
-else
-    echo "conda not found in /opt/conda or /root/miniconda3" >&2
-    exit 1
-fi
-
-__conda_setup="$("$_CONDA_BIN" 'shell.bash' 'hook' 2> /dev/null)"
-if [ $? -eq 0 ]; then
-    eval "$__conda_setup"
-elif [ -f "$_CONDA_SH" ]; then
-    . "$_CONDA_SH"
-else
-    export PATH="$(dirname "$_CONDA_BIN"):$PATH"
-fi
-unset __conda_setup
-unset _CONDA_BIN
-unset _CONDA_SH
-# <<< conda initialize <<<
-
-conda activate /opt/data/private/envs/Online
-
 # 固定在项目根目录执行，避免脚本迁移后相对路径失效
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -78,9 +42,9 @@ learning_rate_expert=2e-3
 learning_rate_router=2e-3
 patience=3
 
-# 与 run_com.sh 一致的限流并行：默认4张卡，每张卡并行2个任务
-GPU_IDS_STR="${GPU_IDS:-0,1,2}"
-MAX_PER_GPU="${MAX_PER_GPU:-2}"
+# 限流并行：默认使用1块GPU，每块GPU上最多同时跑5个任务
+GPU_IDS_STR="${GPU_IDS:-0}"
+MAX_PER_GPU="${MAX_PER_GPU:-5}"
 IFS=',' read -r -a GPU_IDS <<< "$GPU_IDS_STR"
 echo "[CONFIG] GPU_IDS_STR=${GPU_IDS_STR} parsed_gpus=${GPU_IDS[*]} MAX_PER_GPU=${MAX_PER_GPU}"
 

@@ -165,37 +165,18 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.tsb_eps = float(getattr(args, "tsb_eps", 1e-8))
         self.tsb_buffer_size = int(getattr(args, "tsb_buffer_size", 32))
         self.online_buffer = deque(maxlen=self.tsb_buffer_size)
-        self.expert_params = list(self.model.experts.parameters())
+        self.num_tsb_experts = self.model.num_experts // 2
+        # Split expert params: first half uses TSB, second half uses pure g_cur.
+        self.tsb_expert_params = []
+        self.pure_expert_params = []
+        for idx, expert in enumerate(self.model.experts):
+            if idx < self.num_tsb_experts:
+                self.tsb_expert_params.extend(expert.parameters())
+            else:
+                self.pure_expert_params.extend(expert.parameters())
+        self.expert_params = self.tsb_expert_params + self.pure_expert_params
         self.router_params = list(self.model.router.parameters())
-        self.base_learning_rate_expert = float(self.args.learning_rate_expert)
-        self.base_learning_rate_router = float(self.args.learning_rate_router)
-        self.prev_online_mse = None
-        self.online_mse_ema = None
-        self.online_mse_ema_beta = 0.9
 
-    def _set_optimizer_lr(self, optimizer, lr):
-        for group in optimizer.param_groups:
-            group["lr"] = lr
-
-    def _adaptive_online_hparams(self):
-        if self.prev_online_mse is None or self.online_mse_ema is None:
-            return self.base_learning_rate_expert, self.base_learning_rate_router, self.tsb_alpha
-
-        ratio = self.prev_online_mse / (self.online_mse_ema + self.tsb_eps)
-        lr_scale = float(np.clip(np.sqrt(ratio), 0.5, 2.0))
-        expert_lr = self.base_learning_rate_expert * lr_scale
-        router_lr = self.base_learning_rate_router * lr_scale
-        dynamic_tsb_alpha = float(np.clip(self.tsb_alpha / lr_scale, 0.05, 0.95))
-        return expert_lr, router_lr, dynamic_tsb_alpha
-
-    def _update_online_mse_state(self, mse_value):
-        mse_value = float(mse_value)
-        self.prev_online_mse = mse_value
-        if self.online_mse_ema is None:
-            self.online_mse_ema = mse_value
-        else:
-            beta = self.online_mse_ema_beta
-            self.online_mse_ema = beta * self.online_mse_ema + (1.0 - beta) * mse_value
 
     def _get_data(self, flag):
         args = self.args
@@ -260,8 +241,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return data_set, data_loader
 
     def _select_expert_optimizer(self):
-        self.opt_expert = optim.AdamW(self.expert_params, lr=self.args.learning_rate_expert)
-        return self.opt_expert
+        self.opt_expert_tsb = optim.AdamW(self.tsb_expert_params, lr=self.args.learning_rate_expert)
+        self.opt_expert_pure = optim.AdamW(self.pure_expert_params, lr=self.args.learning_rate_expert)
 
     def _select_router_optimizer(self):
         self.opt_router = optim.AdamW(self.router_params, lr=self.args.learning_rate_router)
@@ -283,7 +264,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
         self.model.set_router_mode(False)
-        self.opt_expert = self._select_expert_optimizer()
+        self._select_expert_optimizer()
         self.opt_router = self._select_router_optimizer()
         criterion = self._select_criterion()
 
@@ -298,7 +279,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
             for i, (batch_x, batch_y, batch_x_mark, batch_y_mark) in enumerate(train_loader):
                 iter_count += 1
-                self.opt_expert.zero_grad()
+                self.opt_expert_tsb.zero_grad()
+                self.opt_expert_pure.zero_grad()
 
                 expert_preds, expert_reps, true = self._process_one_batch(
                     train_data, batch_x, batch_y, batch_x_mark, batch_y_mark
@@ -335,11 +317,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
                 if self.args.use_amp:
                     scaler.scale(loss).backward()
-                    scaler.step(self.opt_expert)
+                    scaler.step(self.opt_expert_tsb)
+                    scaler.step(self.opt_expert_pure)
                     scaler.update()
                 else:
                     loss.backward()
-                    self.opt_expert.step()
+                    self.opt_expert_tsb.step()
+                    self.opt_expert_pure.step()
                 self.model.store_grad()
 
             print(f"Epoch: {epoch + 1} cost time: {time.time() - epoch_time}")
@@ -355,7 +339,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 print("Early stopping")
                 break
 
-            adjust_learning_rate(self.opt_expert, epoch + 1, self.args)
+            adjust_learning_rate(self.opt_expert_tsb, epoch + 1, self.args)
+            adjust_learning_rate(self.opt_expert_pure, epoch + 1, self.args)
 
         best_model_path = path + "/checkpoint.pth"
         self.model.load_state_dict(torch.load(best_model_path))
@@ -442,6 +427,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
         batch_y = batch_y[:, -self.args.pred_len :, f_dim:].to(self.device)
         true = rearrange(batch_y, "b t d -> b (t d)")
 
+        # Pre-compute the full ordered param list used for g_cur collection.
+        all_expert_params = self.tsb_expert_params + self.pure_expert_params
+
         preds = []
         trues = []
         # Online TSB is sample-wise (batch_size=1 is expected).
@@ -451,63 +439,75 @@ class Exp_TS2VecSupervised(Exp_Basic):
             y_t = true[i : i + 1]
 
             for _ in range(self.n_inner):
-                expert_lr, router_lr, dynamic_tsb_alpha = self._adaptive_online_hparams()
-                self._set_optimizer_lr(self.opt_expert, expert_lr)
-                self._set_optimizer_lr(self.opt_router, router_lr)
-
                 # Step A: current gradient for experts (router frozen by optimizer separation).
-                self.opt_expert.zero_grad()
+                self.opt_expert_tsb.zero_grad()
+                self.opt_expert_pure.zero_grad()
                 self.opt_router.zero_grad()
                 y_hat_t = self.model.route_and_aggregate(x_t, x_mark_t)
                 loss_cur = criterion(y_hat_t, y_t)
                 loss_cur.backward()
-                g_cur = [
-                    p.grad.detach().clone() if p.grad is not None else None
-                    for p in self.expert_params
-                ]
+                g_cur = {
+                    id(p): p.grad.detach().clone() if p.grad is not None else None
+                    for p in all_expert_params
+                }
 
-                # Step B: reference gradient from buffer
-                g_ref = []
-                for p in self.expert_params:
-                    g_ref.append(torch.zeros_like(p, device=p.device))
+                # Step B: reference gradient from buffer (only needed for TSB experts).
+                g_ref = {}
+                for p in self.tsb_expert_params:
+                    g_ref[id(p)] = torch.zeros_like(p, device=p.device)
 
                 if len(self.online_buffer) > 0:
                     for x_b, x_mark_b, y_b in self.online_buffer:
-                        self.opt_expert.zero_grad()
+                        self.opt_expert_tsb.zero_grad()
+                        self.opt_expert_pure.zero_grad()
                         self.opt_router.zero_grad()
                         y_hat_b = self.model.route_and_aggregate(x_b, x_mark_b)
                         loss_b = criterion(y_hat_b, y_b)
                         loss_b.backward()
-                        for j, p in enumerate(self.expert_params):
+                        for p in self.tsb_expert_params:
                             if p.grad is not None:
-                                g_ref[j] += p.grad.detach()
+                                g_ref[id(p)] += p.grad.detach()
 
                     inv_n = 1.0 / float(len(self.online_buffer))
-                    for j in range(len(g_ref)):
-                        g_ref[j] = g_ref[j] * inv_n
+                    for p in self.tsb_expert_params:
+                        g_ref[id(p)] = g_ref[id(p)] * inv_n
 
-                # Step C + D: EMA smoothing + TSB filtering
-                self.opt_expert.zero_grad()
+                # Step C + D: apply gradients per group.
+                self.opt_expert_tsb.zero_grad()
+                self.opt_expert_pure.zero_grad()
                 self.opt_router.zero_grad()
-                for j, p in enumerate(self.expert_params):
-                    if g_cur[j] is None:
+
+                # TSB experts: EMA smoothing + TSB filtering.
+                for p in self.tsb_expert_params:
+                    gc = g_cur[id(p)]
+                    if gc is None:
                         continue
                     if len(self.online_buffer) == 0:
-                        g_filtered = g_cur[j]
+                        g_filtered = gc
                     else:
-                        g_smooth = (1.0 - dynamic_tsb_alpha) * g_cur[j] + dynamic_tsb_alpha * g_ref[j]
-                        dot = torch.sum(g_smooth * g_ref[j])
+                        gr = g_ref[id(p)]
+                        g_smooth = (1.0 - self.tsb_alpha) * gc + self.tsb_alpha * gr
+                        dot = torch.sum(g_smooth * gr)
                         if dot < 0:
-                            ref_norm_sq = torch.sum(g_ref[j] * g_ref[j]) + self.tsb_eps
-                            g_filtered = g_smooth - (dot / ref_norm_sq) * g_ref[j]
+                            ref_norm_sq = torch.sum(gr * gr) + self.tsb_eps
+                            g_filtered = g_smooth - (dot / ref_norm_sq) * gr
                         else:
                             g_filtered = g_smooth
                     p.grad = g_filtered.clone()
 
-                # Step E1: update experts with TSB-filtered grads.
-                self.opt_expert.step()
+                # Pure experts: use g_cur directly, no TSB, no buffer.
+                for p in self.pure_expert_params:
+                    gc = g_cur[id(p)]
+                    if gc is None:
+                        continue
+                    p.grad = gc.clone()
+
+                # Step E1: update experts.
+                self.opt_expert_tsb.step()
+                self.opt_expert_pure.step()
                 self.model.store_grad()
-                self.opt_expert.zero_grad()
+                self.opt_expert_tsb.zero_grad()
+                self.opt_expert_pure.zero_grad()
                 self.opt_router.zero_grad()
 
                 # Step E2: router-only update (current sample only, no buffer, no TSB).
@@ -519,8 +519,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 loss_router.backward()
                 self.opt_router.step()
                 self.opt_router.zero_grad()
-                self.opt_expert.zero_grad()
-                self._update_online_mse_state(loss_router.detach().item())
+                self.opt_expert_tsb.zero_grad()
+                self.opt_expert_pure.zero_grad()
 
             # Step F: update online buffer
             self.online_buffer.append(
