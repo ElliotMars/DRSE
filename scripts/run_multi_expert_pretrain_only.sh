@@ -8,8 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 ROOT_PATH="$PROJECT_ROOT/data/"
-LOG_DIR="$PROJECT_ROOT/log/$(date +%Y%m%d_%H%M%S)"
-CHECKPOINT_ROOT="$PROJECT_ROOT/checkpoints"
+LOG_DIR="$PROJECT_ROOT/log/pretrain_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 
 # 运行前检查数据文件是否存在
@@ -26,7 +25,7 @@ if [ $missing -ne 0 ]; then
     exit 1
 fi
 
-## Multi-expert
+## Multi-expert pretraining only: 4 datasets x 3 horizons = 12 jobs
 online_learning='full'
 i=1
 ns=(1)
@@ -45,43 +44,13 @@ tsb_buffer_size=32
 learning_rate_expert=2e-3
 learning_rate_router=2e-3
 patience=3
-opt_name="adam"
-
-# PRETRAIN_MODE=load 使用已有 checkpoint，PRETRAIN_MODE=retrain 重新预训练。
-PRETRAIN_MODE="${PRETRAIN_MODE:-load}"
-if [[ "$PRETRAIN_MODE" != "load" && "$PRETRAIN_MODE" != "retrain" ]]; then
-    echo "Invalid PRETRAIN_MODE=$PRETRAIN_MODE, expected load or retrain" >&2
-    exit 1
-fi
-
-find_latest_checkpoint() {
-  local method="$1"
-  local data="$2"
-  local pred_len="$3"
-  local online="$4"
-  local opt="$5"
-  local bsz="$6"
-  local pattern="$CHECKPOINT_ROOT/${method}_${data}_pl${pred_len}_ol${online}_opt${opt}_tb${bsz}_"
-  local latest=""
-  local ckpt
-
-  shopt -s nullglob
-  for ckpt in "${pattern}"*/checkpoint.pth; do
-    if [[ -z "$latest" || "$ckpt" > "$latest" ]]; then
-      latest="$ckpt"
-    fi
-  done
-  shopt -u nullglob
-
-  echo "$latest"
-}
 
 # 限流并行：默认使用1张GPU，每张GPU最多同时跑5个任务
 GPU_IDS_STR="${GPU_IDS:-0}"
 MAX_PER_GPU="${MAX_PER_GPU:-5}"
 IFS=',' read -r -a GPU_IDS <<< "$GPU_IDS_STR"
 echo "[CONFIG] GPU_IDS_STR=${GPU_IDS_STR} parsed_gpus=${GPU_IDS[*]} MAX_PER_GPU=${MAX_PER_GPU}"
-echo "[CONFIG] PRETRAIN_MODE=${PRETRAIN_MODE} CHECKPOINT_ROOT=${CHECKPOINT_ROOT}"
+echo "[CONFIG] pretrain only, skip_test enabled, log_dir=${LOG_DIR}"
 
 declare -a RUN_PIDS=()
 declare -A PID_GPU=()
@@ -155,21 +124,9 @@ chosen_router_lr="$learning_rate_router"
 chosen_lambda_div="$lambda_div"
 pick_next_gpu
 gpu="$PICKED_GPU"
-log_file="$LOG_DIR/multi_expert_${data}_${len}_${online_learning}.out"
+log_file="$LOG_DIR/pretrain_multi_expert_${data}_${len}.out"
 
-extra_args=(--pretrain_mode "$PRETRAIN_MODE")
-if [[ "$PRETRAIN_MODE" == "load" ]]; then
-    latest_ckpt=$(find_latest_checkpoint "$m" "$data" "$len" "$online_learning" "$opt_name" "$bsz")
-    if [[ -z "$latest_ckpt" ]]; then
-        echo "No checkpoint found for data=${data} pred_len=${len} under ${CHECKPOINT_ROOT}" >&2
-        exit 1
-    fi
-    extra_args+=(--pretrained_checkpoint "$latest_ckpt")
-    echo "[LOAD] data=${data} pred_len=${len} gpu=${gpu} checkpoint=${latest_ckpt}"
-else
-    echo "[TRAIN] data=${data} pred_len=${len} gpu=${gpu} expert_lr=${chosen_lr} router_lr=${chosen_router_lr} lambda_div=${chosen_lambda_div}"
-fi
-
+echo "[PRETRAIN] data=${data} pred_len=${len} gpu=${gpu} expert_lr=${chosen_lr} router_lr=${chosen_router_lr} lambda_div=${chosen_lambda_div}"
 submit_job "$gpu" "$log_file" \
     --method "$m" \
     --root_path "$ROOT_PATH" \
@@ -180,7 +137,7 @@ submit_job "$gpu" "$log_file" \
     --seq_len 60 \
     --label_len 0 \
     --pred_len "$len" \
-    --des 'Exp' \
+    --des 'PretrainOnly' \
     --itr "$i" \
     --train_epochs 15 \
     --patience "$patience" \
@@ -194,7 +151,7 @@ submit_job "$gpu" "$log_file" \
     --tsb_alpha "$tsb_alpha" \
     --tsb_eps "$tsb_eps" \
     --tsb_buffer_size "$tsb_buffer_size" \
-    "${extra_args[@]}"
+    --skip_test
 done
 done
 done
@@ -202,4 +159,4 @@ done
 done
 
 wait
-echo "All runs finished. log_dir=$LOG_DIR"
+echo "All pretraining runs finished. log_dir=$LOG_DIR"

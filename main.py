@@ -110,6 +110,10 @@ def parse_args():
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
     parser.add_argument('--skip_test', action='store_true', default=False, help='skip test stage after training')
+    parser.add_argument('--pretrain_mode', type=str, default='retrain', choices=['retrain', 'load'],
+                        help='retrain before test or load an existing checkpoint')
+    parser.add_argument('--pretrained_checkpoint', type=str, default='',
+                        help='checkpoint path used when --pretrain_mode load')
     parser.add_argument('--mix', action='store_false', help='use mix attention in generative decoder', default=True)
     parser.add_argument('--cols', type=str, nargs='+', help='certain cols from the data files as the input features')
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
@@ -277,8 +281,14 @@ if __name__ == '__main__':
         init_dl_program(args, seed=ii)
         args.finetune_model_seed = ii
         exp = Exp(args)  # set experiments
-        print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-        exp.train(setting)
+        if args.pretrain_mode == 'load':
+            if not args.pretrained_checkpoint:
+                raise ValueError('--pretrained_checkpoint is required when --pretrain_mode load')
+            print('>>>>>>>load pretrained checkpoint : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(args.pretrained_checkpoint))
+            exp.load_pretrained(args.pretrained_checkpoint)
+        else:
+            print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+            exp.train(setting)
 
         if args.skip_test:
             print('>>>>>>>testing skipped : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
