@@ -44,8 +44,10 @@ class SamePadConv(nn.Module):
         self.chunk_in_d = self.dim // self.n_chunks
         self.chunk_out_d = int(in_channels * kernel_size // self.n_chunks)
 
-        self.grads = torch.Tensor(sum(self.grad_dim)).fill_(0).to(self.device)
-        self.f_grads = torch.Tensor(sum(self.grad_dim)).fill_(0).to(self.device)
+        # These tensors are forecasting state and must survive checkpoints.
+        self.register_buffer('grads', torch.zeros(sum(self.grad_dim), device=self.device))
+        self.register_buffer('f_grads', torch.zeros(sum(self.grad_dim), device=self.device))
+        self.state_updates_enabled = True
         nh = 64
         self.controller = nn.Sequential(nn.Linear(self.chunk_in_d, nh), nn.SiLU())
         self.calib_w = nn.Linear(nh, self.chunk_out_d)
@@ -55,6 +57,8 @@ class SamePadConv(nn.Module):
         self.W = nn.Parameter(torch.empty(dim, 32), requires_grad=False)
         nn.init.xavier_uniform_(self.W.data)
         self.W.data = normalize(self.W.data)
+        self.register_buffer('q_ema', torch.zeros(dim, device=self.device))
+        self.register_buffer('trigger', torch.zeros((), dtype=torch.bool, device=self.device))
 
         # self.calib_w = torch.nn.Parameter(torch.ones(out_channels, in_channels,1), requires_grad = True)
         # self.calib_b = torch.nn.Parameter(torch.zeros([out_channels]), requires_grad = True)
@@ -65,7 +69,6 @@ class SamePadConv(nn.Module):
         self.gamma = gamma
         self.f_gamma = 0.3
         self.cos = nn.CosineSimilarity(dim=0, eps=1e-6)
-        self.trigger = 0
         self.tau = 0.75
 
     def ctrl_params(self):
@@ -78,15 +81,18 @@ class SamePadConv(nn.Module):
     def store_grad(self):
 
         # 实现梯度存储逻辑
-        grad = self.conv.weight.grad.data.clone()
+        if self.conv.weight.grad is None:
+            return
+        grad = self.conv.weight.grad.detach().clone()
         grad = nn.functional.normalize(grad)
         grad = grad.view(-1)
-        self.f_grads = self.f_gamma * self.f_grads + (1 - self.f_gamma) * grad
-        self.grads = self.gamma * self.grads + (1 - self.gamma) * grad
-        if not self.training:
-            e = self.cos(self.f_grads, self.grads)
-            if e < -self.tau:
-                self.trigger = 1
+        with torch.no_grad():
+            self.f_grads.mul_(self.f_gamma).add_(grad, alpha=1 - self.f_gamma)
+            self.grads.mul_(self.gamma).add_(grad, alpha=1 - self.gamma)
+            if not self.training:
+                e = self.cos(self.f_grads, self.grads)
+                if e < -self.tau:
+                    self.trigger.fill_(True)
 
     def fw_chunks(self):
 
@@ -97,18 +103,19 @@ class SamePadConv(nn.Module):
         b = self.calib_b(rep)
         f = self.calib_f(rep)
         q = torch.cat([w.view(-1), b.view(-1), f.view(-1)])
-        if not hasattr(self, 'q_ema'):
-            setattr(self, 'q_ema', torch.zeros(*q.size()).float().to(self.device))
-
-        self.q_ema = self.f_gamma * self.q_ema + (1 - self.f_gamma) * q
-        q = self.q_ema
-        if self.trigger == 1:
+        if self.state_updates_enabled:
+            # Replay/reference forwards must not advance this persistent state,
+            # and the EMA must never retain a graph from an earlier batch.
+            with torch.no_grad():
+                self.q_ema.mul_(self.f_gamma).add_(q.detach(), alpha=1 - self.f_gamma)
+        q_state = self.q_ema.detach()
+        if bool(self.trigger.item()) and self.state_updates_enabled:
             dim = w.size(0)
-            self.trigger = 0
+            self.trigger.fill_(False)
             # read
 
-            att = q @ self.W
-            att = F.softmax(att / 0.5)
+            att = q_state @ self.W
+            att = F.softmax(att / 0.5, dim=0)
 
             v, idx = torch.topk(att, 2)
             ww = torch.index_select(self.W, 1, idx)

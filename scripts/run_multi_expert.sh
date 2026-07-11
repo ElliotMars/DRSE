@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 
-# 使用当前 shell 环境中的 Python，不在脚本内写死或切换 conda 环境。
-PYTHON_BIN="${PYTHON:-python}"
+# Prefer the same environment as run.sh; PYTHON can still override it.
+if [[ -n "${PYTHON:-}" ]]; then
+    PYTHON_BIN="$PYTHON"
+elif [[ -x "/opt/data/private/envs/Online/bin/python" ]]; then
+    PYTHON_BIN="/opt/data/private/envs/Online/bin/python"
+else
+    PYTHON_BIN="python"
+fi
 
 # 固定在项目根目录执行，避免脚本迁移后相对路径失效
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,24 +37,33 @@ online_learning='full'
 i=1
 ns=(1)
 bszs=(1)
-lens=(1 24 48)
 methods=('multi_expert')
-datasets=(ETTh2 ETTm1 WTH ECL)
+read -r -a lens <<< "${LENS:-1 24 48}"
+read -r -a datasets <<< "${DATASETS:-ETTh2 ETTm1 WTH ECL}"
 
-num_experts=4
-top_k=2
-lambda_div=0.03
-tsb_alpha=0.5
+num_experts="${NUM_EXPERTS:-4}"
+top_k="${TOP_K:-$num_experts}"
+lambda_div="${LAMBDA_DIV:-0.0}"
+tsb_alpha="${TSB_ALPHA:-0.5}"
 tsb_eps=1e-8
-tsb_buffer_size=32
+tsb_buffer_size="${TSB_BUFFER_SIZE:-8}"
+expert_grad_clip="${EXPERT_GRAD_CLIP:-1.0}"
+router_grad_clip="${ROUTER_GRAD_CLIP:-0.5}"
+router_temperature="${ROUTER_TEMPERATURE:-2.0}"
+router_entropy_weight="${ROUTER_ENTROPY_WEIGHT:-0.001}"
+robust_fallback_threshold="${ROBUST_FALLBACK_THRESHOLD:-25.0}"
+online_log_interval="${ONLINE_LOG_INTERVAL:-500}"
 
-learning_rate_expert=2e-3
-learning_rate_router=2e-3
+learning_rate_expert=1e-3
+learning_rate_router=1e-3
+online_lr_expert=1e-4
+online_lr_router=1e-5
 patience=3
 opt_name="adam"
+checkpoint_tag="stateful_pc_v2_ne${num_experts}_tk${top_k}"
 
 # PRETRAIN_MODE=load 使用已有 checkpoint，PRETRAIN_MODE=retrain 重新预训练。
-PRETRAIN_MODE="${PRETRAIN_MODE:-load}"
+PRETRAIN_MODE="${PRETRAIN_MODE:-retrain}"
 if [[ "$PRETRAIN_MODE" != "load" && "$PRETRAIN_MODE" != "retrain" ]]; then
     echo "Invalid PRETRAIN_MODE=$PRETRAIN_MODE, expected load or retrain" >&2
     exit 1
@@ -76,9 +91,9 @@ find_latest_checkpoint() {
   echo "$latest"
 }
 
-# 限流并行：默认使用1张GPU，每张GPU最多同时跑5个任务
+# Stable tuning default: one job per GPU.
 GPU_IDS_STR="${GPU_IDS:-0}"
-MAX_PER_GPU="${MAX_PER_GPU:-5}"
+MAX_PER_GPU="${MAX_PER_GPU:-1}"
 IFS=',' read -r -a GPU_IDS <<< "$GPU_IDS_STR"
 echo "[CONFIG] GPU_IDS_STR=${GPU_IDS_STR} parsed_gpus=${GPU_IDS[*]} MAX_PER_GPU=${MAX_PER_GPU}"
 echo "[CONFIG] PRETRAIN_MODE=${PRETRAIN_MODE} CHECKPOINT_ROOT=${CHECKPOINT_ROOT}"
@@ -152,14 +167,27 @@ for m in "${methods[@]}"; do
 for data in "${datasets[@]}"; do
 chosen_lr="$learning_rate_expert"
 chosen_router_lr="$learning_rate_router"
+chosen_online_lr="$online_lr_expert"
+chosen_online_router_lr="$online_lr_router"
 chosen_lambda_div="$lambda_div"
+case "$data" in
+  ECL)
+    chosen_lr=3e-3
+    chosen_router_lr=3e-3
+    chosen_online_lr=1e-5
+    chosen_online_router_lr=1e-6
+    ;;
+  WTH)
+    chosen_online_lr=5e-5
+    ;;
+esac
 pick_next_gpu
 gpu="$PICKED_GPU"
 log_file="$LOG_DIR/multi_expert_${data}_${len}_${online_learning}.out"
 
-extra_args=(--pretrain_mode "$PRETRAIN_MODE")
+extra_args=(--pretrain_mode "$PRETRAIN_MODE" --checkpoint_tag "$checkpoint_tag")
 if [[ "$PRETRAIN_MODE" == "load" ]]; then
-    latest_ckpt=$(find_latest_checkpoint "$m" "$data" "$len" "$online_learning" "$opt_name" "$bsz")
+    latest_ckpt=$(find_latest_checkpoint "${m}_${checkpoint_tag}" "$data" "$len" "$online_learning" "$opt_name" "$bsz")
     if [[ -z "$latest_ckpt" ]]; then
         echo "No checkpoint found for data=${data} pred_len=${len} under ${CHECKPOINT_ROOT}" >&2
         exit 1
@@ -187,6 +215,8 @@ submit_job "$gpu" "$log_file" \
     --learning_rate "$chosen_lr" \
     --learning_rate_expert "$chosen_lr" \
     --learning_rate_router "$chosen_router_lr" \
+    --online_lr_expert "$chosen_online_lr" \
+    --online_lr_router "$chosen_online_router_lr" \
     --online_learning "$online_learning" \
     --num_experts "$num_experts" \
     --top_k "$top_k" \
@@ -194,6 +224,12 @@ submit_job "$gpu" "$log_file" \
     --tsb_alpha "$tsb_alpha" \
     --tsb_eps "$tsb_eps" \
     --tsb_buffer_size "$tsb_buffer_size" \
+    --expert_grad_clip "$expert_grad_clip" \
+    --router_grad_clip "$router_grad_clip" \
+    --router_temperature "$router_temperature" \
+    --router_entropy_weight "$router_entropy_weight" \
+    --robust_fallback_threshold "$robust_fallback_threshold" \
+    --online_log_interval "$online_log_interval" \
     "${extra_args[@]}"
 done
 done

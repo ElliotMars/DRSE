@@ -4,6 +4,7 @@ import time
 import warnings
 from collections import defaultdict
 from collections import deque
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -52,6 +53,7 @@ class ExpertNet(nn.Module):
             output_dims=self.hidden_dim,
             hidden_dims=64,
             depth=10,
+            device=self.device,
         )
         self.encoder = TS2VecEncoderWrapper(encoder, mask="all_true").to(self.device)
         self.regressor = nn.Linear(self.hidden_dim, self.output_dim).to(self.device)
@@ -102,6 +104,7 @@ class FSNetTimeExpertNet(nn.Module):
             output_dims=self.hidden_dim,
             hidden_dims=64,
             depth=10,
+            device=self.device,
         )
         self.encoder_time = TS2VecEncoderWrapper(encoder, mask="all_true").to(self.device)
         self.regressor_time = nn.Linear(self.hidden_dim, self.pred_len).to(self.device)
@@ -171,10 +174,13 @@ class net(nn.Module):
         super().__init__()
         self.device = device
         self.num_experts = max(1, int(getattr(args, "num_experts", 4)))
-        self.top_k = max(1, min(int(getattr(args, "top_k", 2)), self.num_experts))
+        self.top_k = max(1, min(int(getattr(args, "top_k", self.num_experts)), self.num_experts))
         self.num_time_experts = min(2, self.num_experts)
         self.num_fsnet_experts = self.num_experts - self.num_time_experts
         self.hidden_dim = 320
+        self.c_out = args.c_out
+        self.pred_len = args.pred_len
+        self.router_temperature = max(float(getattr(args, "router_temperature", 2.0)), 1e-3)
 
         experts = []
         for _ in range(self.num_fsnet_experts):
@@ -184,7 +190,10 @@ class net(nn.Module):
         self.experts = nn.ModuleList(experts)
 
         self.feature_encoder = RoutingFeatureEncoder(args, self.hidden_dim, self.device)
-        self.router = nn.Linear(self.hidden_dim, self.num_experts).to(self.device)
+        self.router = nn.Linear(self.hidden_dim, self.c_out * self.num_experts).to(self.device)
+        # Start from a safe uniform ensemble.
+        nn.init.zeros_(self.router.weight)
+        nn.init.zeros_(self.router.bias)
         self.use_router = False
 
     def router_parameters(self):
@@ -195,15 +204,16 @@ class net(nn.Module):
 
     def _compute_gates(self, x, x_mark):
         _, route_feature = self.feature_encoder(x, x_mark)
-        scores = self.router(route_feature)  # [batch_size, num_experts]
-        gates = torch.softmax(scores, dim=-1)
+        scores = self.router(route_feature)
+        scores = scores.view(x.shape[0], self.c_out, self.num_experts)
+        gates = torch.softmax(scores / self.router_temperature, dim=-1)
 
-        topk_vals, topk_idx = torch.topk(gates, k=self.top_k, dim=-1)
-        del topk_vals
-        mask = torch.zeros_like(gates)
-        mask.scatter_(1, topk_idx, 1.0)
-        gates = gates * mask
-        gates = gates / (gates.sum(dim=-1, keepdim=True) + 1e-8)
+        if self.top_k < self.num_experts:
+            _, topk_idx = torch.topk(gates, k=self.top_k, dim=-1)
+            mask = torch.zeros_like(gates)
+            mask.scatter_(2, topk_idx, 1.0)
+            gates = gates * mask
+            gates = gates / (gates.sum(dim=-1, keepdim=True) + 1e-8)
         return gates
 
     def _prepare_expert_input(self, expert, x, x_mark):
@@ -230,7 +240,11 @@ class net(nn.Module):
         return outputs
 
     def aggregate_with_gates(self, gates, outputs):
-        return torch.sum(gates.unsqueeze(-1) * outputs, dim=1)
+        batch_size = outputs.shape[0]
+        outputs = outputs.view(batch_size, self.num_experts, self.pred_len, self.c_out)
+        weights = gates.permute(0, 2, 1).unsqueeze(2)
+        prediction = torch.sum(weights * outputs, dim=1)
+        return rearrange(prediction, "b t d -> b (t d)")
 
     def route_and_aggregate(self, x, x_mark, outputs=None):
         gates = self._compute_gates(x, x_mark)
@@ -257,15 +271,22 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.n_inner = args.n_inner
         self.opt_str = args.opt
         self.model = net(args, device=self.device)
-        self.lambda_div = float(getattr(args, "lambda_div", 0.05))
+        self.lambda_div = float(getattr(args, "lambda_div", 0.0))
         self.tsb_alpha = float(getattr(args, "tsb_alpha", 0.5))
         self.tsb_eps = float(getattr(args, "tsb_eps", 1e-8))
-        self.tsb_buffer_size = int(getattr(args, "tsb_buffer_size", 32))
+        self.tsb_buffer_size = int(getattr(args, "tsb_buffer_size", 8))
         self.online_buffer = deque(maxlen=self.tsb_buffer_size)
         self.expert_params = list(self.model.experts.parameters())
         self.router_params = self.model.router_parameters()
-        self.base_learning_rate_expert = float(self.args.learning_rate_expert)
-        self.base_learning_rate_router = float(self.args.learning_rate_router)
+        self.base_learning_rate_expert = float(self.args.online_lr_expert)
+        self.base_learning_rate_router = float(self.args.online_lr_router)
+        self.expert_grad_clip = float(getattr(args, "expert_grad_clip", 1.0))
+        self.router_grad_clip = float(getattr(args, "router_grad_clip", 0.5))
+        self.router_entropy_weight = float(getattr(args, "router_entropy_weight", 1e-3))
+        self.robust_fallback_threshold = float(getattr(args, "robust_fallback_threshold", 25.0))
+        self.online_log_interval = int(getattr(args, "online_log_interval", 500))
+        self.online_step = 0
+        self.fallback_count = 0
         self.prev_online_mse = None
         self.online_mse_ema = None
         self.online_mse_ema_beta = 0.9
@@ -279,10 +300,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
             return self.base_learning_rate_expert, self.base_learning_rate_router, self.tsb_alpha
 
         ratio = self.prev_online_mse / (self.online_mse_ema + self.tsb_eps)
-        lr_scale = float(np.clip(np.sqrt(ratio), 0.5, 2.0))
+        # A sudden error spike must make the update more conservative, not
+        # increase the step size. Never exceed the configured online LR.
+        lr_scale = float(np.clip(1.0 / np.sqrt(max(ratio, self.tsb_eps)), 0.1, 1.0))
         expert_lr = self.base_learning_rate_expert * lr_scale
         router_lr = self.base_learning_rate_router * lr_scale
-        dynamic_tsb_alpha = float(np.clip(self.tsb_alpha / lr_scale, 0.05, 0.95))
+        dynamic_tsb_alpha = float(np.clip(self.tsb_alpha / lr_scale, self.tsb_alpha, 0.95))
         return expert_lr, router_lr, dynamic_tsb_alpha
 
     def _update_online_mse_state(self, mse_value):
@@ -294,38 +317,57 @@ class Exp_TS2VecSupervised(Exp_Basic):
             beta = self.online_mse_ema_beta
             self.online_mse_ema = beta * self.online_mse_ema + (1.0 - beta) * mse_value
 
-    def _router_state_dict(self):
-        state = {}
-        for name, tensor in self.model.feature_encoder.state_dict().items():
-            state["feature_encoder." + name] = tensor.detach().clone()
-        for name, tensor in self.model.router.state_dict().items():
-            state["router." + name] = tensor.detach().clone()
-        return state
+    @contextmanager
+    def _fsnet_state_updates(self, enabled):
+        modules = [m for m in self.model.modules() if hasattr(m, "state_updates_enabled")]
+        previous = [m.state_updates_enabled for m in modules]
+        for module in modules:
+            module.state_updates_enabled = enabled
+        try:
+            yield
+        finally:
+            for module, old_value in zip(modules, previous):
+                module.state_updates_enabled = old_value
 
-    def _load_router_state_dict(self, state):
-        feature_state = {
-            name[len("feature_encoder."):]: tensor
-            for name, tensor in state.items()
-            if name.startswith("feature_encoder.")
-        }
-        router_state = {
-            name[len("router."):]: tensor
-            for name, tensor in state.items()
-            if name.startswith("router.")
-        }
-        self.model.feature_encoder.load_state_dict(feature_state)
-        self.model.router.load_state_dict(router_state)
 
-    def _save_checkpoint_without_pretrained_router(self, path, router_state):
-        self._load_router_state_dict(router_state)
-        torch.save(self.model.state_dict(), path)
+    def _robust_prediction(self, gates, outputs):
+        raw_prediction = self.model.aggregate_with_gates(gates, outputs)
+        if self.robust_fallback_threshold <= 0:
+            return raw_prediction, torch.zeros(outputs.shape[0], dtype=torch.bool, device=outputs.device)
+
+        if outputs.shape[1] >= 3:
+            fallback = outputs.median(dim=1).values
+        else:
+            fallback = outputs.mean(dim=1)
+        disagreement = (outputs - fallback.unsqueeze(1)).pow(2).mean(dim=(1, 2))
+        scale = fallback.pow(2).mean(dim=1) + 1.0
+        unsafe = disagreement > self.robust_fallback_threshold * scale
+        unsafe |= ~torch.isfinite(raw_prediction).all(dim=1)
+        safe_prediction = torch.where(unsafe.unsqueeze(1), fallback, raw_prediction)
+        self.fallback_count += int(unsafe.sum().item())
+        return safe_prediction, unsafe
 
     def load_pretrained(self, checkpoint_path):
         state = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(state)
+        try:
+            self.model.load_state_dict(state)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Incompatible multi-expert checkpoint. Re-run the v2 pretraining script."
+            ) from exc
         self.model.set_router_mode(True)
         self.opt_expert = self._select_expert_optimizer()
         self.opt_router = self._select_router_optimizer()
+        optimizer_path = os.path.join(os.path.dirname(checkpoint_path), "optimizer.pth")
+        if os.path.exists(optimizer_path):
+            optimizer_state = torch.load(optimizer_path, map_location=self.device)
+            self.opt_expert.load_state_dict(optimizer_state["expert"])
+            self.opt_router.load_state_dict(optimizer_state["router"])
+            print("Loaded optimizer state:", optimizer_path)
+        else:
+            print("Optimizer state not found; starting online moments from zero")
+        self._set_optimizer_lr(self.opt_expert, self.base_learning_rate_expert)
+        self._set_optimizer_lr(self.opt_router, self.base_learning_rate_router)
         return self.model
 
     def _get_data(self, flag):
@@ -391,11 +433,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return data_set, data_loader
 
     def _select_expert_optimizer(self):
-        self.opt_expert = optim.AdamW(self.expert_params, lr=self.args.learning_rate_expert)
+        self.opt_expert = optim.AdamW(
+            self.expert_params, lr=self.args.learning_rate_expert, weight_decay=self.args.weight_decay
+        )
         return self.opt_expert
 
     def _select_router_optimizer(self):
-        self.opt_router = optim.AdamW(self.router_params, lr=self.args.learning_rate_router)
+        self.opt_router = optim.AdamW(
+            self.router_params, lr=self.args.learning_rate_router, weight_decay=self.args.weight_decay
+        )
         return self.opt_router
 
     def _select_criterion(self):
@@ -413,7 +459,6 @@ class Exp_TS2VecSupervised(Exp_Basic):
         train_steps = len(train_loader)
         early_stopping = EarlyStopping(patience=self.args.patience, verbose=True)
 
-        initial_router_state = self._router_state_dict()
         self.model.set_router_mode(True)
         self.opt_expert = self._select_expert_optimizer()
         self.opt_router = self._select_router_optimizer()
@@ -433,7 +478,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 self.opt_expert.zero_grad()
                 self.opt_router.zero_grad()
 
-                expert_outputs, routed_pred, expert_reps, true = self._process_one_batch(
+                expert_outputs, routed_pred, expert_reps, gates, true = self._process_one_batch(
                     train_data, batch_x, batch_y, batch_x_mark, batch_y_mark
                 )
                 expert_losses = [criterion(expert_outputs[:, e, :], true) for e in range(expert_outputs.shape[1])]
@@ -455,7 +500,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     loss_div = torch.tensor(0.0, device=self.device)
 
                 loss_expert = loss_pred + self.lambda_div * loss_div
-                loss_router = criterion(routed_pred, true)
+                gate_entropy = -(gates.clamp_min(1e-8) * gates.clamp_min(1e-8).log()).sum(dim=-1).mean()
+                loss_router = criterion(routed_pred, true) - self.router_entropy_weight * gate_entropy
                 loss = loss_expert + loss_router
                 train_loss.append(loss_expert.item())
 
@@ -469,11 +515,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
                 if self.args.use_amp:
                     scaler.scale(loss).backward()
+                    scaler.unscale_(self.opt_expert)
+                    scaler.unscale_(self.opt_router)
+                    nn.utils.clip_grad_norm_(self.expert_params, self.expert_grad_clip)
+                    nn.utils.clip_grad_norm_(self.router_params, self.router_grad_clip)
                     scaler.step(self.opt_expert)
                     scaler.step(self.opt_router)
                     scaler.update()
                 else:
                     loss.backward()
+                    nn.utils.clip_grad_norm_(self.expert_params, self.expert_grad_clip)
+                    nn.utils.clip_grad_norm_(self.router_params, self.router_grad_clip)
                     self.opt_expert.step()
                     self.opt_router.step()
                 self.model.store_grad()
@@ -486,29 +538,43 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     epoch + 1, train_steps, train_loss, vali_loss
                 )
             )
+            previous_best = early_stopping.best_score
             early_stopping(vali_loss, self.model, path)
+            improved = previous_best is None or -vali_loss >= previous_best + early_stopping.delta
+            if improved:
+                torch.save(
+                    {"expert": self.opt_expert.state_dict(), "router": self.opt_router.state_dict()},
+                    os.path.join(path, "optimizer.pth"),
+                )
             if early_stopping.early_stop:
                 print("Early stopping")
                 break
 
             adjust_learning_rate(self.opt_expert, epoch + 1, self.args)
+            adjust_learning_rate(self.opt_router, epoch + 1, self.args)
 
         best_model_path = path + "/checkpoint.pth"
         self.model.load_state_dict(torch.load(best_model_path))
-        self._save_checkpoint_without_pretrained_router(best_model_path, initial_router_state)
+        optimizer_path = os.path.join(path, "optimizer.pth")
+        if os.path.exists(optimizer_path):
+            optimizer_state = torch.load(optimizer_path, map_location=self.device)
+            self.opt_expert.load_state_dict(optimizer_state["expert"])
+            self.opt_router.load_state_dict(optimizer_state["router"])
+        self._set_optimizer_lr(self.opt_expert, self.base_learning_rate_expert)
+        self._set_optimizer_lr(self.opt_router, self.base_learning_rate_router)
         return self.model
 
     def vali(self, vali_data, vali_loader, criterion):
         self.model.eval()
         self.model.set_router_mode(True)
         total_loss = []
-        for batch_x, batch_y, batch_x_mark, batch_y_mark in vali_loader:
-            expert_outputs, _, _, true = self._process_one_batch(
-                vali_data, batch_x, batch_y, batch_x_mark, batch_y_mark, mode="vali"
-            )
-            pred = expert_outputs.mean(dim=1)
-            loss = criterion(pred.detach().cpu(), true.detach().cpu())
-            total_loss.append(loss.item())
+        with torch.no_grad(), self._fsnet_state_updates(False):
+            for batch_x, batch_y, batch_x_mark, batch_y_mark in vali_loader:
+                _, routed_pred, _, _, true = self._process_one_batch(
+                    vali_data, batch_x, batch_y, batch_x_mark, batch_y_mark, mode="vali"
+                )
+                loss = criterion(routed_pred.detach().cpu(), true.detach().cpu())
+                total_loss.append(loss.item())
         total_loss = np.average(total_loss)
         self.model.train()
         return total_loss
@@ -518,6 +584,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         self.model.eval()
         self.model.set_router_mode(True)
+        if self.online == "regressor":
+            for expert in self.model.experts:
+                for name, parameter in expert.named_parameters():
+                    if "regressor" not in name:
+                        parameter.requires_grad = False
 
         preds = []
         trues = []
@@ -557,6 +628,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
     def _process_one_batch(self, dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark, mode="train"):
         if mode == "test":
+            if self.online == "none":
+                return self._predict_without_update(batch_x, batch_y, batch_x_mark)
             return self._ol_one_batch(dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark)
 
         x = batch_x.float().to(self.device)
@@ -569,10 +642,24 @@ class Exp_TS2VecSupervised(Exp_Basic):
         f_dim = -1 if self.args.features == "MS" else 0
         batch_y = batch_y[:, -self.args.pred_len :, f_dim:].to(self.device)
         true = rearrange(batch_y, "b t d -> b (t d)")
-        return expert_outputs, routed_pred, expert_reps, true
+        return expert_outputs, routed_pred, expert_reps, gates, true
+
+    def _predict_without_update(self, batch_x, batch_y, batch_x_mark):
+        x = batch_x.float().to(self.device)
+        x_mark = batch_x_mark.float().to(self.device)
+        batch_y = batch_y.float().to(self.device)
+        f_dim = -1 if self.args.features == "MS" else 0
+        batch_y = batch_y[:, -self.args.pred_len :, f_dim:]
+        true = rearrange(batch_y, "b t d -> b (t d)")
+        with torch.no_grad(), self._fsnet_state_updates(False):
+            gates = self.model._compute_gates(x, x_mark)
+            outputs = self.model.forward_experts(x, x_mark, return_repr=False)
+            prediction, _ = self._robust_prediction(gates, outputs)
+        return prediction, true
 
     def _ol_one_batch(self, dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark):
         criterion = self._select_criterion()
+        update_criterion = nn.SmoothL1Loss(beta=1.0)
         x = batch_x.float().to(self.device)
         batch_x_mark = batch_x_mark.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
@@ -583,7 +670,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         preds = []
         trues = []
-        # Online TSB is sample-wise (batch_size=1 is expected).
+        # TSB remains sample-wise, while its reference gradient is evaluated in
+        # one read-only buffer batch to avoid advancing FSNet state repeatedly.
         for i in range(x.shape[0]):
             x_t = x[i : i + 1]
             x_mark_t = batch_x_mark[i : i + 1]
@@ -595,40 +683,39 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 self._set_optimizer_lr(self.opt_expert, expert_lr)
                 self._set_optimizer_lr(self.opt_router, router_lr)
 
-                # Step A: current gradient for experts (router frozen by optimizer separation).
+                # Step A: pre-update prediction and current expert gradient.
                 self.opt_expert.zero_grad()
                 self.opt_router.zero_grad()
-                y_hat_t = self.model.route_and_aggregate(x_t, x_mark_t)
+                gates_t = self.model._compute_gates(x_t, x_mark_t)
+                expert_outputs_t = self.model.forward_experts(x_t, x_mark_t, return_repr=False)
+                y_hat_t = self.model.aggregate_with_gates(gates_t, expert_outputs_t)
                 if inner_idx == 0:
-                    pred_t = y_hat_t.detach()
-                loss_cur = criterion(y_hat_t, y_t)
+                    pred_t, _ = self._robust_prediction(gates_t.detach(), expert_outputs_t.detach())
+                loss_cur = update_criterion(y_hat_t, y_t)
                 loss_cur.backward()
                 g_cur = [
                     p.grad.detach().clone() if p.grad is not None else None
                     for p in self.expert_params
                 ]
 
-                # Step B: reference gradient from buffer
-                g_ref = []
-                for p in self.expert_params:
-                    g_ref.append(torch.zeros_like(p, device=p.device))
-
+                # Step B: a batched, read-only TSB reference gradient.
+                g_ref = [torch.zeros_like(p, device=p.device) for p in self.expert_params]
                 if len(self.online_buffer) > 0:
-                    for x_b, x_mark_b, y_b in self.online_buffer:
-                        self.opt_expert.zero_grad()
-                        self.opt_router.zero_grad()
+                    x_b = torch.cat([item[0] for item in self.online_buffer], dim=0)
+                    x_mark_b = torch.cat([item[1] for item in self.online_buffer], dim=0)
+                    y_b = torch.cat([item[2] for item in self.online_buffer], dim=0)
+                    self.opt_expert.zero_grad()
+                    self.opt_router.zero_grad()
+                    with self._fsnet_state_updates(False):
                         y_hat_b = self.model.route_and_aggregate(x_b, x_mark_b)
-                        loss_b = criterion(y_hat_b, y_b)
-                        loss_b.backward()
-                        for j, p in enumerate(self.expert_params):
-                            if p.grad is not None:
-                                g_ref[j] += p.grad.detach()
+                        loss_b = update_criterion(y_hat_b, y_b)
+                    loss_b.backward()
+                    g_ref = [
+                        p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
+                        for p in self.expert_params
+                    ]
 
-                    inv_n = 1.0 / float(len(self.online_buffer))
-                    for j in range(len(g_ref)):
-                        g_ref[j] = g_ref[j] * inv_n
-
-                # Step C + D: EMA smoothing + TSB filtering
+                # Step C + D: EMA smoothing and TSB conflict projection.
                 self.opt_expert.zero_grad()
                 self.opt_router.zero_grad()
                 for j, p in enumerate(self.expert_params):
@@ -646,29 +733,69 @@ class Exp_TS2VecSupervised(Exp_Basic):
                             g_filtered = g_smooth
                     p.grad = g_filtered.clone()
 
-                # Step E1: update experts with TSB-filtered grads.
-                self.opt_expert.step()
-                self.model.store_grad()
+                # Step E1: clipped expert update.
+                expert_grad_norm = nn.utils.clip_grad_norm_(self.expert_params, self.expert_grad_clip)
+                if torch.isfinite(expert_grad_norm):
+                    self.opt_expert.step()
+                    self.model.store_grad()
+                else:
+                    print("[ONLINE] skipped non-finite expert update at step", self.online_step)
                 self.opt_expert.zero_grad()
                 self.opt_router.zero_grad()
 
-                # Step E2: router-only update (current sample only, no buffer, no TSB).
-                with torch.no_grad():
-                    outputs_detached = self.model.forward_experts(x_t, x_mark_t, return_repr=False).detach()
-                self.opt_router.zero_grad()
-                y_hat_router = self.model.route_and_aggregate(x_t, x_mark_t, outputs=outputs_detached)
-                loss_router = criterion(y_hat_router, y_t)
+                # Step E2: router-only update. The extra expert forward is
+                # read-only so it cannot advance q_ema/trigger/memory.
+                with torch.no_grad(), self._fsnet_state_updates(False):
+                    outputs_detached = self.model.forward_experts(
+                        x_t, x_mark_t, return_repr=False
+                    ).detach()
+                gates_router = self.model._compute_gates(x_t, x_mark_t)
+                y_hat_router = self.model.aggregate_with_gates(gates_router, outputs_detached)
+                gate_entropy = -(
+                    gates_router.clamp_min(1e-8) * gates_router.clamp_min(1e-8).log()
+                ).sum(dim=-1).mean()
+                loss_router = (
+                    update_criterion(y_hat_router, y_t)
+                    - self.router_entropy_weight * gate_entropy
+                )
                 loss_router.backward()
-                self.opt_router.step()
+                router_grad_norm = nn.utils.clip_grad_norm_(self.router_params, self.router_grad_clip)
+                if torch.isfinite(router_grad_norm):
+                    self.opt_router.step()
+                else:
+                    print("[ONLINE] skipped non-finite router update at step", self.online_step)
                 self.opt_router.zero_grad()
                 self.opt_expert.zero_grad()
-                self._update_online_mse_state(loss_router.detach().item())
 
-            # Step F: update online buffer
+                online_mse = criterion(y_hat_router.detach(), y_t).item()
+                self._update_online_mse_state(online_mse)
+
+                if self.online_log_interval > 0 and self.online_step % self.online_log_interval == 0:
+                    expert_mse = (expert_outputs_t.detach() - y_t.unsqueeze(1)).pow(2).mean(dim=2)
+                    uniform_mse = criterion(expert_outputs_t.detach().mean(dim=1), y_t).item()
+                    print(
+                        "[ONLINE] step={} mse={:.6f} uniform={:.6f} experts={} "
+                        "lr_e={:.2e} lr_r={:.2e} alpha={:.3f} entropy={:.3f} "
+                        "grad_e={:.3f} grad_r={:.3f} fallbacks={}".format(
+                            self.online_step,
+                            criterion(pred_t, y_t).item(),
+                            uniform_mse,
+                            [round(v, 6) for v in expert_mse[0].tolist()],
+                            expert_lr,
+                            router_lr,
+                            dynamic_tsb_alpha,
+                            gate_entropy.item(),
+                            float(expert_grad_norm),
+                            float(router_grad_norm),
+                            self.fallback_count,
+                        )
+                    )
+
             self.online_buffer.append(
                 (x_t.detach().clone(), x_mark_t.detach().clone(), y_t.detach().clone())
             )
-            preds.append(pred_t)
+            preds.append(pred_t.detach())
             trues.append(y_t.detach())
+            self.online_step += 1
 
         return torch.cat(preds, dim=0), torch.cat(trues, dim=0)

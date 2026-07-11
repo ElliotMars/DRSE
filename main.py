@@ -114,6 +114,8 @@ def parse_args():
                         help='retrain before test or load an existing checkpoint')
     parser.add_argument('--pretrained_checkpoint', type=str, default='',
                         help='checkpoint path used when --pretrain_mode load')
+    parser.add_argument('--checkpoint_tag', type=str, default='',
+                        help='optional tag used to isolate incompatible checkpoint variants')
     parser.add_argument('--mix', action='store_false', help='use mix attention in generative decoder', default=True)
     parser.add_argument('--cols', type=str, nargs='+', help='certain cols from the data files as the input features')
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
@@ -126,6 +128,10 @@ def parse_args():
                         help='optimizer learning rate for expert parameters')
     parser.add_argument('--learning_rate_router', type=float, default=None,
                         help='optimizer learning rate for router parameters')
+    parser.add_argument('--online_lr_expert', type=float, default=1e-4,
+                        help='base expert learning rate during online testing')
+    parser.add_argument('--online_lr_router', type=float, default=1e-5,
+                        help='base router learning rate during online testing')
     parser.add_argument('--learning_rate_w', type=float, default=0.001, help='optimizer learning rate')
     parser.add_argument('--learning_rate_bias', type=float, default=0.001, help='optimizer learning rate')
     parser.add_argument('--weight_decay', type=float, default=1e-3, help='optimizer learning rate')
@@ -160,11 +166,17 @@ def parse_args():
     parser.add_argument('--test_bsz', type=int, default=1)
     parser.add_argument('--n_inner', type=int, default=1)
     parser.add_argument('--num_experts', type=int, default=4, help='number of experts for multi-expert OneNet variants')
-    parser.add_argument('--top_k', type=int, default=2, help='top-k experts selected by MoE router')
-    parser.add_argument('--lambda_div', type=float, default=0.05, help='weight of expert diversity loss during pretraining')
+    parser.add_argument('--top_k', type=int, default=4, help='top-k experts selected by MoE router')
+    parser.add_argument('--lambda_div', type=float, default=0.0, help='weight of expert diversity loss during pretraining')
     parser.add_argument('--tsb_alpha', type=float, default=0.5, help='EMA factor for online TSB smoothing')
     parser.add_argument('--tsb_eps', type=float, default=1e-8, help='epsilon for online TSB projection')
-    parser.add_argument('--tsb_buffer_size', type=int, default=32, help='buffer size for online TSB reference gradient')
+    parser.add_argument('--tsb_buffer_size', type=int, default=8, help='buffer size for batched online TSB reference gradient')
+    parser.add_argument('--expert_grad_clip', type=float, default=1.0)
+    parser.add_argument('--router_grad_clip', type=float, default=0.5)
+    parser.add_argument('--router_temperature', type=float, default=2.0)
+    parser.add_argument('--router_entropy_weight', type=float, default=1e-3)
+    parser.add_argument('--robust_fallback_threshold', type=float, default=25.0)
+    parser.add_argument('--online_log_interval', type=int, default=500)
     parser.add_argument('--channel_cross', type=bool, default=False)
 
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
@@ -273,6 +285,8 @@ if __name__ == '__main__':
         # setting record of experiments
         # method_name = 'ts2vec_finetune' if args.finetune else 'ts2vec_supervised'
         method_name = args.method
+        if args.checkpoint_tag:
+            method_name = '{}_{}'.format(method_name, args.checkpoint_tag)
         uid = uuid.uuid4().hex[:4]
         suffix = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M") + "_" + uid
         setting = '{}_{}_pl{}_ol{}_opt{}_tb{}_{}'.format(method_name, args.data, args.pred_len, args.online_learning,
