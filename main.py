@@ -175,7 +175,8 @@ def parse_args():
     parser.add_argument('--router_grad_clip', type=float, default=0.5)
     parser.add_argument('--router_temperature', type=float, default=2.0)
     parser.add_argument('--router_entropy_weight', type=float, default=1e-3)
-    parser.add_argument('--robust_fallback_threshold', type=float, default=25.0)
+    parser.add_argument('--robust_fallback_threshold', type=float, default=0.0,
+                        help='deprecated compatibility option; v3 only replaces non-finite predictions')
     parser.add_argument('--online_log_interval', type=int, default=500)
     parser.add_argument('--channel_cross', type=bool, default=False)
 

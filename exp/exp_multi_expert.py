@@ -283,10 +283,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.expert_grad_clip = float(getattr(args, "expert_grad_clip", 1.0))
         self.router_grad_clip = float(getattr(args, "router_grad_clip", 0.5))
         self.router_entropy_weight = float(getattr(args, "router_entropy_weight", 1e-3))
-        self.robust_fallback_threshold = float(getattr(args, "robust_fallback_threshold", 25.0))
         self.online_log_interval = int(getattr(args, "online_log_interval", 500))
         self.online_step = 0
         self.fallback_count = 0
+        self.fallback_channel_count = 0
         self.prev_online_mse = None
         self.online_mse_ema = None
         self.online_mse_ema_beta = 0.9
@@ -330,22 +330,40 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 module.state_updates_enabled = old_value
 
 
-    def _robust_prediction(self, gates, outputs):
-        raw_prediction = self.model.aggregate_with_gates(gates, outputs)
-        if self.robust_fallback_threshold <= 0:
-            return raw_prediction, torch.zeros(outputs.shape[0], dtype=torch.bool, device=outputs.device)
+    def _safe_prediction(self, gates, outputs):
+        """Use router output unless an individual value is NaN or infinite.
 
-        if outputs.shape[1] >= 3:
-            fallback = outputs.median(dim=1).values
-        else:
-            fallback = outputs.mean(dim=1)
-        disagreement = (outputs - fallback.unsqueeze(1)).pow(2).mean(dim=(1, 2))
-        scale = fallback.pow(2).mean(dim=1) + 1.0
-        unsafe = disagreement > self.robust_fallback_threshold * scale
-        unsafe |= ~torch.isfinite(raw_prediction).all(dim=1)
-        safe_prediction = torch.where(unsafe.unsqueeze(1), fallback, raw_prediction)
-        self.fallback_count += int(unsafe.sum().item())
-        return safe_prediction, unsafe
+        Expert disagreement is expected under distribution shift and must be
+        resolved by the learned router. The old sample-wise median fallback
+        bypassed all channel gates when one ECL channel shifted, so fallback is
+        now limited to non-finite values and is applied coordinate-wise.
+        """
+        raw_prediction = self.model.aggregate_with_gates(gates, outputs)
+        finite_experts = torch.isfinite(outputs)
+        finite_sum = torch.where(
+            finite_experts, outputs, torch.zeros_like(outputs)
+        ).sum(dim=1)
+        finite_count = finite_experts.sum(dim=1).clamp_min(1)
+        finite_mean = finite_sum / finite_count
+
+        unsafe_values = ~torch.isfinite(raw_prediction)
+        safe_prediction = torch.where(unsafe_values, finite_mean, raw_prediction)
+        safe_prediction = torch.nan_to_num(
+            safe_prediction, nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        unsafe_channels = unsafe_values.view(
+            outputs.shape[0], self.args.pred_len, self.args.c_out
+        ).any(dim=1)
+        self.fallback_count += int(unsafe_values.sum().item())
+        self.fallback_channel_count += int(unsafe_channels.sum().item())
+        return safe_prediction, unsafe_channels
+
+    @staticmethod
+    def _independent_expert_mse(expert_outputs, target):
+        """Sum independently supervised expert MSEs, matching OneNet's scale."""
+        per_expert = (expert_outputs - target.unsqueeze(1)).pow(2).mean(dim=2)
+        return per_expert.sum(dim=1).mean()
 
     def load_pretrained(self, checkpoint_path):
         state = torch.load(checkpoint_path, map_location=self.device)
@@ -654,12 +672,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         with torch.no_grad(), self._fsnet_state_updates(False):
             gates = self.model._compute_gates(x, x_mark)
             outputs = self.model.forward_experts(x, x_mark, return_repr=False)
-            prediction, _ = self._robust_prediction(gates, outputs)
+            prediction, _ = self._safe_prediction(gates, outputs)
         return prediction, true
 
     def _ol_one_batch(self, dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark):
         criterion = self._select_criterion()
-        update_criterion = nn.SmoothL1Loss(beta=1.0)
         x = batch_x.float().to(self.device)
         batch_x_mark = batch_x_mark.float().to(self.device)
         batch_y = batch_y.float().to(self.device)
@@ -686,12 +703,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 # Step A: pre-update prediction and current expert gradient.
                 self.opt_expert.zero_grad()
                 self.opt_router.zero_grad()
-                gates_t = self.model._compute_gates(x_t, x_mark_t)
+                with torch.no_grad():
+                    gates_t = self.model._compute_gates(x_t, x_mark_t)
                 expert_outputs_t = self.model.forward_experts(x_t, x_mark_t, return_repr=False)
-                y_hat_t = self.model.aggregate_with_gates(gates_t, expert_outputs_t)
                 if inner_idx == 0:
-                    pred_t, _ = self._robust_prediction(gates_t.detach(), expert_outputs_t.detach())
-                loss_cur = update_criterion(y_hat_t, y_t)
+                    raw_pred_t = self.model.aggregate_with_gates(
+                        gates_t, expert_outputs_t.detach()
+                    )
+                    pred_t, unsafe_channels_t = self._safe_prediction(
+                        gates_t, expert_outputs_t.detach()
+                    )
+                loss_cur = self._independent_expert_mse(expert_outputs_t, y_t)
                 loss_cur.backward()
                 g_cur = [
                     p.grad.detach().clone() if p.grad is not None else None
@@ -707,8 +729,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     self.opt_expert.zero_grad()
                     self.opt_router.zero_grad()
                     with self._fsnet_state_updates(False):
-                        y_hat_b = self.model.route_and_aggregate(x_b, x_mark_b)
-                        loss_b = update_criterion(y_hat_b, y_b)
+                        expert_outputs_b = self.model.forward_experts(
+                            x_b, x_mark_b, return_repr=False
+                        )
+                        loss_b = self._independent_expert_mse(expert_outputs_b, y_b)
                     loss_b.backward()
                     g_ref = [
                         p.grad.detach().clone() if p.grad is not None else torch.zeros_like(p)
@@ -754,10 +778,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 gate_entropy = -(
                     gates_router.clamp_min(1e-8) * gates_router.clamp_min(1e-8).log()
                 ).sum(dim=-1).mean()
-                loss_router = (
-                    update_criterion(y_hat_router, y_t)
-                    - self.router_entropy_weight * gate_entropy
-                )
+                loss_router = criterion(y_hat_router, y_t)
                 loss_router.backward()
                 router_grad_norm = nn.utils.clip_grad_norm_(self.router_params, self.router_grad_clip)
                 if torch.isfinite(router_grad_norm):
@@ -773,14 +794,26 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 if self.online_log_interval > 0 and self.online_step % self.online_log_interval == 0:
                     expert_mse = (expert_outputs_t.detach() - y_t.unsqueeze(1)).pow(2).mean(dim=2)
                     uniform_mse = criterion(expert_outputs_t.detach().mean(dim=1), y_t).item()
+                    pred_by_channel = (
+                        pred_t.view(-1, self.args.pred_len, self.args.c_out)
+                        - y_t.view(-1, self.args.pred_len, self.args.c_out)
+                    ).pow(2).mean(dim=1)
+                    worst_channel_mse, worst_channel = pred_by_channel.max(dim=1)
+                    raw_mse = criterion(raw_pred_t, y_t).item()
                     print(
-                        "[ONLINE] step={} mse={:.6f} uniform={:.6f} experts={} "
+                        "[ONLINE] step={} mse={:.6f} raw={:.6f} uniform={:.6f} experts={} "
+                        "worst_ch={}:{} unsafe_ch={} "
                         "lr_e={:.2e} lr_r={:.2e} alpha={:.3f} entropy={:.3f} "
-                        "grad_e={:.3f} grad_r={:.3f} fallbacks={}".format(
+                        "grad_e={:.3f} grad_r={:.3f} "
+                        "fallback_values={} fallback_channels={}".format(
                             self.online_step,
                             criterion(pred_t, y_t).item(),
+                            raw_mse,
                             uniform_mse,
                             [round(v, 6) for v in expert_mse[0].tolist()],
+                            int(worst_channel[0].item()),
+                            round(float(worst_channel_mse[0].item()), 6),
+                            int(unsafe_channels_t[0].sum().item()),
                             expert_lr,
                             router_lr,
                             dynamic_tsb_alpha,
@@ -788,6 +821,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                             float(expert_grad_norm),
                             float(router_grad_norm),
                             self.fallback_count,
+                            self.fallback_channel_count,
                         )
                     )
 
