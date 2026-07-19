@@ -93,16 +93,12 @@ class Dataset_ETT_hour(Dataset):
         self.data_stamp = data_stamp
         
     def __getitem__(self, index):
-        if self.delay_fb and self.set_type==2:
-            s_begin = index * self.pred_len
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
-        else:
-            s_begin = index 
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
+        # Delayed feedback is an online-learning protocol, not a sampling
+        # stride. Forecast origins always remain one timestamp apart.
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
         if self.inverse:
@@ -115,10 +111,7 @@ class Dataset_ETT_hour(Dataset):
         return seq_x, seq_y, seq_x_mark, seq_y_mark
     
     def __len__(self):
-        if self.delay_fb and self.set_type==2:
-            return (len(self.data_x) - self.seq_len- self.pred_len) // self.pred_len
-        else:
-            return len(self.data_x) - self.seq_len- self.pred_len + 1
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
@@ -202,16 +195,12 @@ class Dataset_ETT_minute(Dataset):
         self.data_stamp = data_stamp
     
     def __getitem__(self, index):
-        if self.delay_fb and self.set_type==2:
-            s_begin = index * self.pred_len
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
-        else:
-            s_begin = index 
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
+        # Delayed feedback is an online-learning protocol, not a sampling
+        # stride. Forecast origins always remain one timestamp apart.
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
         if self.inverse:
@@ -224,10 +213,7 @@ class Dataset_ETT_minute(Dataset):
         return seq_x, seq_y, seq_x_mark, seq_y_mark
     
     def __len__(self):
-        if self.delay_fb and self.set_type==2:
-            return (len(self.data_x) - self.seq_len- self.pred_len) // self.pred_len
-        else:
-            return len(self.data_x) - self.seq_len- self.pred_len + 1
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
 
@@ -311,16 +297,12 @@ class Dataset_Custom(Dataset):
         self.data_stamp = data_stamp
     
     def __getitem__(self, index):
-        if self.delay_fb and self.set_type==2:
-            s_begin = index * self.pred_len
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
-        else:
-            s_begin = index 
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
+        # Delayed feedback is an online-learning protocol, not a sampling
+        # stride. Forecast origins always remain one timestamp apart.
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
         if self.inverse:
@@ -333,10 +315,7 @@ class Dataset_Custom(Dataset):
         return seq_x, seq_y, seq_x_mark, seq_y_mark
     
     def __len__(self):
-        if self.delay_fb and self.set_type==2:
-            return (len(self.data_x) - self.seq_len- self.pred_len) // self.pred_len
-        else:
-            return len(self.data_x) - self.seq_len- self.pred_len + 1
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
@@ -414,16 +393,12 @@ class Dataset_Pred(Dataset):
         self.data_stamp = data_stamp
     
     def __getitem__(self, index):
-        if self.delay_fb and self.set_type==2:
-            s_begin = index * self.pred_len
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
-        else:
-            s_begin = index 
-            s_end = s_begin + self.seq_len
-            r_begin = s_end - self.label_len 
-            r_end = r_begin + self.label_len + self.pred_len
+        # Delayed feedback is an online-learning protocol, not a sampling
+        # stride. Forecast origins always remain one timestamp apart.
+        s_begin = index
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
 
         seq_x = self.data_x[s_begin:s_end]
         if self.inverse:
@@ -436,10 +411,7 @@ class Dataset_Pred(Dataset):
         return seq_x, seq_y, seq_x_mark, seq_y_mark
     
     def __len__(self):
-        if self.delay_fb and self.set_type==2:
-            return (len(self.data_x) - self.seq_len- self.pred_len) // self.pred_len
-        else:
-            return len(self.data_x) - self.seq_len- self.pred_len + 1
+        return len(self.data_x) - self.seq_len - self.pred_len + 1
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
