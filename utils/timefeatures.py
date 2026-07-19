@@ -152,6 +152,9 @@ def time_features(dates, timeenc=1, freq='h'):
 
     if timeenc == 2:
         dt = pd.to_datetime(dates.date.values)
+        # DatetimeIndex.isocalendar was added after the project's pandas 0.25
+        # environment; ``week`` is the equivalent legacy accessor.
+        iso_week = dt.isocalendar().week.to_numpy() if hasattr(dt, 'isocalendar') else dt.week.to_numpy()
         return np.stack([
             dt.minute.to_numpy(),
             dt.hour.to_numpy(),
@@ -159,5 +162,5 @@ def time_features(dates, timeenc=1, freq='h'):
             dt.day.to_numpy(),
             dt.dayofyear.to_numpy(),
             dt.month.to_numpy(),
-            dt.isocalendar().week.to_numpy(),
+            iso_week,
         ], axis=1).astype(np.float32)

@@ -21,7 +21,7 @@ CHECKPOINT_ROOT="$PROJECT_ROOT/checkpoints"
 mkdir -p "$LOG_DIR"
 
 # 运行前检查数据文件是否存在
-required_files=("ETTh2.csv" "ETTm1.csv" "WTH.csv" "ECL.csv")
+required_files=("ECL.csv")
 missing=0
 for f in "${required_files[@]}"; do
     if [ ! -f "${ROOT_PATH}${f}" ]; then
@@ -40,8 +40,8 @@ i=1
 ns=(1)
 bszs=(1)
 methods=('multi_expert')
-read -r -a lens <<< "${LENS:-1 24 48}"
-read -r -a datasets <<< "${DATASETS:-ETTh2 ETTm1 WTH ECL}"
+lens=(24 48)
+datasets=(ECL)
 
 num_experts="${NUM_EXPERTS:-4}"
 top_k="${TOP_K:-$num_experts}"
@@ -65,12 +65,8 @@ pretrained_checkpoint_tag="${PRETRAINED_CHECKPOINT_TAG:-stateful_pc_v2_ne${num_e
 checkpoint_tag="${CHECKPOINT_TAG:-${pretrained_checkpoint_tag}_online_mse_v3}"
 online_variant="online_mse_v3"
 
-# PRETRAIN_MODE=load 使用已有 checkpoint，PRETRAIN_MODE=retrain 重新预训练。
-PRETRAIN_MODE="${PRETRAIN_MODE:-load}"
-if [[ "$PRETRAIN_MODE" != "load" && "$PRETRAIN_MODE" != "retrain" ]]; then
-    echo "Invalid PRETRAIN_MODE=$PRETRAIN_MODE, expected load or retrain" >&2
-    exit 1
-fi
+# 所有实验均重新预训练，不加载已有 checkpoint。
+PRETRAIN_MODE="retrain"
 
 find_latest_checkpoint() {
   local method="$1"
@@ -94,9 +90,9 @@ find_latest_checkpoint() {
   echo "$latest"
 }
 
-# Stable tuning default: one job per GPU.
+# Run the two ECL horizons concurrently by default.
 GPU_IDS_STR="${GPU_IDS:-0}"
-MAX_PER_GPU="${MAX_PER_GPU:-1}"
+MAX_PER_GPU="${MAX_PER_GPU:-2}"
 IFS=',' read -r -a GPU_IDS <<< "$GPU_IDS_STR"
 echo "[CONFIG] GPU_IDS_STR=${GPU_IDS_STR} parsed_gpus=${GPU_IDS[*]} MAX_PER_GPU=${MAX_PER_GPU}"
 echo "[CONFIG] PRETRAIN_MODE=${PRETRAIN_MODE} CHECKPOINT_ROOT=${CHECKPOINT_ROOT}"
@@ -223,6 +219,7 @@ submit_job "$gpu" "$log_file" \
     --online_lr_expert "$chosen_online_lr" \
     --online_lr_router "$chosen_online_router_lr" \
     --online_learning "$online_learning" \
+    --delay_fb \
     --num_experts "$num_experts" \
     --top_k "$top_k" \
     --lambda_div "$chosen_lambda_div" \

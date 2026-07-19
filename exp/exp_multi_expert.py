@@ -431,6 +431,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
             root_path=args.root_path,
             data_path=args.data_path,
             flag=flag,
+            delay_fb=args.delay_fb,
             size=[args.seq_len, args.label_len, args.pred_len],
             features=args.features,
             target=args.target,
@@ -597,6 +598,30 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.model.train()
         return total_loss
 
+    def _delayed_online_batch(
+        self, dataset, feedback_queue, batch_x, batch_y, batch_x_mark, batch_y_mark
+    ):
+        batch_preds, batch_trues = [], []
+        for i in range(batch_x.shape[0]):
+            if len(feedback_queue) >= self.args.pred_len:
+                released = feedback_queue.popleft()
+                self._ol_one_batch(dataset, *released)
+
+            current = (
+                batch_x[i : i + 1].detach().clone(),
+                batch_y[i : i + 1].detach().clone(),
+                batch_x_mark[i : i + 1].detach().clone(),
+                batch_y_mark[i : i + 1].detach().clone(),
+            )
+            pred, true = self._predict_without_update(
+                current[0], current[1], current[2]
+            )
+            feedback_queue.append(current)
+            batch_preds.append(pred)
+            batch_trues.append(true)
+
+        return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
+
     def test(self, setting):
         test_data, test_loader = self._get_data(flag="test")
 
@@ -612,10 +637,18 @@ class Exp_TS2VecSupervised(Exp_Basic):
         trues = []
         start = time.time()
         maes, mses, rmses, mapes, mspes = [], [], [], [], []
+        feedback_queue = deque() if self.args.delay_fb and self.online != "none" else None
+        if feedback_queue is not None:
+            print("[DELAY_FB] rolling origins; feedback delay={} steps".format(self.args.pred_len))
         for batch_x, batch_y, batch_x_mark, batch_y_mark in tqdm(test_loader):
-            pred, true = self._process_one_batch(
-                test_data, batch_x, batch_y, batch_x_mark, batch_y_mark, mode="test"
-            )
+            if feedback_queue is not None:
+                pred, true = self._delayed_online_batch(
+                    test_data, feedback_queue, batch_x, batch_y, batch_x_mark, batch_y_mark
+                )
+            else:
+                pred, true = self._process_one_batch(
+                    test_data, batch_x, batch_y, batch_x_mark, batch_y_mark, mode="test"
+                )
             preds.append(pred.detach().cpu())
             trues.append(true.detach().cpu())
             mae, mse, rmse, mape, mspe = metric(

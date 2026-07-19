@@ -177,6 +177,7 @@ submit_job "$gpu" "$log_file" \
     --online_lr_expert "$chosen_online_lr" \
     --online_lr_router "$chosen_online_router_lr" \
     --online_learning "$online_learning" \
+    --delay_fb \
     --num_experts "$num_experts" \
     --top_k "$top_k" \
     --lambda_div "$chosen_lambda_div" \

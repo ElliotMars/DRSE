@@ -178,6 +178,28 @@ def parse_args():
     parser.add_argument('--robust_fallback_threshold', type=float, default=0.0,
                         help='deprecated compatibility option; v3 only replaces non-finite predictions')
     parser.add_argument('--online_log_interval', type=int, default=500)
+    # DynaME baseline
+    parser.add_argument('--dyname_period_num', type=int, default=2)
+    parser.add_argument('--dyname_krr_lambda', type=float, default=1e-4)
+    parser.add_argument('--dyname_krr_train_num', type=int, default=8)
+    parser.add_argument('--dyname_temperature', type=float, default=1.0)
+    parser.add_argument('--dyname_beta', type=float, default=0.3)
+    parser.add_argument('--dyname_delta', type=float, default=0.01)
+    parser.add_argument('--dyname_past_num', type=int, default=672)
+    parser.add_argument('--dyname_online_lr', type=float, default=1e-3)
+    # PatchTST-DGrad baseline
+    parser.add_argument('--dgrad_online_lr', type=float, default=1e-3)
+    parser.add_argument('--dgrad_grad_clip', type=float, default=1.0)
+    # Shared online baselines
+    parser.add_argument('--baseline_online_lr', type=float, default=1e-3)
+    parser.add_argument('--replay_buffer_size', type=int, default=128)
+    parser.add_argument('--replay_batch_size', type=int, default=16)
+    parser.add_argument('--dsof_student_width', type=int, default=16)
+    parser.add_argument('--dsof_student_lr', type=float, default=1e-3)
+    parser.add_argument('--dsof_td_weight', type=float, default=0.2)
+    parser.add_argument('--proceed_concept_dim', type=int, default=200)
+    parser.add_argument('--proceed_bottleneck_dim', type=int, default=32)
+    parser.add_argument('--proceed_online_lr', type=float, default=1e-3)
     parser.add_argument('--channel_cross', type=bool, default=False)
 
     parser.add_argument('--use_gpu', type=bool, default=True, help='use gpu')
