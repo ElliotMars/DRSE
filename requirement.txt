@@ -1,6 +1,9 @@
-matplotlib==3.1.1
-numpy==1.19.4
-pandas==0.25.1
-scikit_learn==0.21.3
-tqdm==4.62.3
-einops==0.4.0
+# Verified with Python 3.10.20. Install the PyTorch build matching your CUDA runtime.
+torch>=2.0,<3.0
+numpy==1.26.4
+pandas==2.3.3
+scipy==1.15.3
+scikit-learn==1.7.2
+numexpr==2.14.1
+tqdm==4.68.4
+einops==0.8.2

@@ -21,7 +21,7 @@ CHECKPOINT_ROOT="$PROJECT_ROOT/checkpoints"
 mkdir -p "$LOG_DIR"
 
 # 运行前检查数据文件是否存在
-required_files=("ECL.csv")
+required_files=("ETTh2.csv" "ETTm1.csv" "WTH.csv" "ECL.csv")
 missing=0
 for f in "${required_files[@]}"; do
     if [ ! -f "${ROOT_PATH}${f}" ]; then
@@ -40,8 +40,8 @@ i=1
 ns=(1)
 bszs=(1)
 methods=('multi_expert')
-lens=(24 48)
-datasets=(ECL)
+lens=(1 24 48)
+datasets=(ETTh2 ETTm1 WTH ECL)
 
 num_experts="${NUM_EXPERTS:-4}"
 top_k="${TOP_K:-$num_experts}"
@@ -90,7 +90,7 @@ find_latest_checkpoint() {
   echo "$latest"
 }
 
-# Run the two ECL horizons concurrently by default.
+# Run up to two dataset-horizon jobs concurrently per GPU by default.
 GPU_IDS_STR="${GPU_IDS:-0}"
 MAX_PER_GPU="${MAX_PER_GPU:-2}"
 IFS=',' read -r -a GPU_IDS <<< "$GPU_IDS_STR"

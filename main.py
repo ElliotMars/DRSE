@@ -171,6 +171,8 @@ def parse_args():
     parser.add_argument('--tsb_alpha', type=float, default=0.5, help='EMA factor for online TSB smoothing')
     parser.add_argument('--tsb_eps', type=float, default=1e-8, help='epsilon for online TSB projection')
     parser.add_argument('--tsb_buffer_size', type=int, default=8, help='buffer size for batched online TSB reference gradient')
+    parser.add_argument('--disable_tsb', action='store_true', default=False,
+                        help='disable TSB reference gradients, smoothing, projection, and adaptive online step sizes')
     parser.add_argument('--expert_grad_clip', type=float, default=1.0)
     parser.add_argument('--router_grad_clip', type=float, default=0.5)
     parser.add_argument('--router_temperature', type=float, default=2.0)

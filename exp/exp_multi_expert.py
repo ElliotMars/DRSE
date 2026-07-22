@@ -275,6 +275,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.tsb_alpha = float(getattr(args, "tsb_alpha", 0.5))
         self.tsb_eps = float(getattr(args, "tsb_eps", 1e-8))
         self.tsb_buffer_size = int(getattr(args, "tsb_buffer_size", 8))
+        self.use_tsb = not bool(getattr(args, "disable_tsb", False))
         self.online_buffer = deque(maxlen=self.tsb_buffer_size)
         self.expert_params = list(self.model.experts.parameters())
         self.router_params = self.model.router_parameters()
@@ -296,6 +297,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
             group["lr"] = lr
 
     def _adaptive_online_hparams(self):
+        if not self.use_tsb:
+            return self.base_learning_rate_expert, self.base_learning_rate_router, 0.0
         if self.prev_online_mse is None or self.online_mse_ema is None:
             return self.base_learning_rate_expert, self.base_learning_rate_router, self.tsb_alpha
 
@@ -754,8 +757,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 ]
 
                 # Step B: a batched, read-only TSB reference gradient.
-                g_ref = [torch.zeros_like(p, device=p.device) for p in self.expert_params]
-                if len(self.online_buffer) > 0:
+                g_ref = None
+                if self.use_tsb and len(self.online_buffer) > 0:
                     x_b = torch.cat([item[0] for item in self.online_buffer], dim=0)
                     x_mark_b = torch.cat([item[1] for item in self.online_buffer], dim=0)
                     y_b = torch.cat([item[2] for item in self.online_buffer], dim=0)
@@ -778,7 +781,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 for j, p in enumerate(self.expert_params):
                     if g_cur[j] is None:
                         continue
-                    if len(self.online_buffer) == 0:
+                    if not self.use_tsb or len(self.online_buffer) == 0:
                         g_filtered = g_cur[j]
                     else:
                         g_smooth = (1.0 - dynamic_tsb_alpha) * g_cur[j] + dynamic_tsb_alpha * g_ref[j]
@@ -821,8 +824,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 self.opt_router.zero_grad()
                 self.opt_expert.zero_grad()
 
-                online_mse = criterion(y_hat_router.detach(), y_t).item()
-                self._update_online_mse_state(online_mse)
+                if self.use_tsb:
+                    online_mse = criterion(y_hat_router.detach(), y_t).item()
+                    self._update_online_mse_state(online_mse)
 
                 if self.online_log_interval > 0 and self.online_step % self.online_log_interval == 0:
                     expert_mse = (expert_outputs_t.detach() - y_t.unsqueeze(1)).pow(2).mean(dim=2)
@@ -858,9 +862,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
                         )
                     )
 
-            self.online_buffer.append(
-                (x_t.detach().clone(), x_mark_t.detach().clone(), y_t.detach().clone())
-            )
+            if self.use_tsb:
+                self.online_buffer.append(
+                    (x_t.detach().clone(), x_mark_t.detach().clone(), y_t.detach().clone())
+                )
             preds.append(pred_t.detach())
             trues.append(y_t.detach())
             self.online_step += 1

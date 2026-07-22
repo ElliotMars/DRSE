@@ -1,144 +1,362 @@
-# (NeurIPS 2023) OneNet: Enhancing Time Series Forecasting Models under Concept Drift by Online Ensembling
+# Online Multi-Expert Time-Series Forecasting
 
-This codebase is the official implementation of [`OneNet: Enhancing Time Series Forecasting Models under Concept Drift by Online Ensembling`](https://arxiv.org/abs/2309.12659) (**NeurIPS 2023**) and [`Addressing Concept Shift in Online Time Series Forecasting: Detect-then-Adapt`](https://arxiv.org/abs/2403.14949)
+本项目面向概念漂移场景下的在线多变量时间序列预测。核心方法 `multi_expert` 将 FSNet 与 FSNet-Time 专家、通道级 MoE 路由和 Temporal Smoothness Buffer（TSB）结合，在统一的滚动延迟反馈协议下完成离线预训练和在线适应。
 
+仓库还保留了 DynaME、PatchTST-DGrad、ER、FSNet、OneNet、DSOF 和 PROCEED 的本地适配实现，用于在相同数据接口和在线协议下进行比较。这里的 baseline 是嵌入本项目结构后的实现，不是对应上游仓库的完整镜像。
 
-## 🔥 Update
-* [2023-09-22]: ⭐️ Paper online. Check out [Detect-then-Adapt](https://arxiv.org/abs/2403.14949) for details.
-* [2023-09-22]: ⭐️ Paper online. Check out [OneNet](https://arxiv.org/abs/2309.12659) for details.
-* [2023-09-20]: 🚀🚀 Codes released.
+> 本 README 只描述未被 `.gitignore` 排除的源码和实验入口。数据、checkpoint、日志和结果文件均为本地运行产物，不纳入版本控制。
 
+## 核心方法
 
-## Introduction for OneNet
+默认的 Multi-Expert 包含：
 
-Online updating of time series forecasting models aims to address the **concept drifting problem** by efficiently updating forecasting models based on streaming data. Many algorithms are designed for online time series forecasting, with some exploiting **cross-variable dependency** while others assume **independence among variables**. Given every data assumption has its own pros and cons in online time series modeling, we propose **On**line **e**nsembling **Net**work (**OneNet**). It dynamically updates and combines two models, with one focusing on modeling the dependency across the time dimension and the other on cross-variate dependency. Our method incorporates a reinforcement learning-based approach into the traditional online convex programming framework, allowing for the linear combination of the two models with dynamically adjusted weights. **OneNet** addresses the main shortcomings of classical online learning methods that tend to be slow in adapting to the concept drift. Empirical results show that OneNet reduces online forecasting error by more than $50$% compared to the State-Of-The-Art (SOTA) method.
+- 2 个 FSNet 专家，建模跨变量表示；
+- 2 个 FSNet-Time 专家，建模每个变量的时间模式；
+- 通道级路由器，为每个变量动态生成专家权重；
+- 可选 top-k 路由；
+- TSB 在线更新机制，通过历史已释放样本的参考梯度进行平滑和冲突投影；
+- 专家与路由器独立的离线、在线学习率和梯度裁剪。
 
-![OneNet](framework.png)
+主要实现位于：
 
-1) The proposed OneNet-TCN (online ensembling of TCN and Time-TCN) surpasses most of the competing baselines across various forecasting horizons;
-2) If the combined branches are stronger, for example, OneNet combined FSNet and Time-FSNet, achieving much better performance than OneNet-TCN. Namely, OneNet can integrate any advanced online forecasting methods or representation learning structures to enhance the robustness of the model.
-3) The average MSE and MAE of OneNet are significantly better than using either branch (FSNet or Time-TCN) alone, which underscores the significance of incorporating online ensembling. 
-4) OneNet achieves faster and better convergence than other methods;
-
-## Introduction for Detect-then-Adapt
-While numerous algorithms have been developed, most of them focus on model design and updating. In practice, many of these methods struggle with continuous performance regression in the face of accumulated concept drifts over time. We first detects drifting conception and then aggressively adapts the current model to the drifted concepts after the detection for rapid adaption. Our empirical studies across six datasets demonstrate the effectiveness of  in improving model adaptation capability. Notably, compared to a simple Temporal Convolutional Network (TCN) baseline, $D^3A$ reduces the average Mean Squared Error (MSE) by $43.9$%. For the state-of-the-art (SOTA) model, the MSE is reduced by $33.3$%.
-
-![Detect-then-Adapt](teaser_d3a.png)
-
-1) **Introduce a Concept Detection Framework:** Our framework monitors loss distribution drift, aiming to predict the occurrence of concept drift. This detector provides instructions for our model updating, enhancing model robustness and AI safety, particularly in high-risk tasks.
-
-2) **More realistic Evaluation setting:** We observe that previous benchmarks often presume a substantial overlap in the forecasting target during testing. In this paper, we advocate for the evaluation of online time series forecasting models with delayed feedback, demonstrating a more realistic and challenging assessment.
-
-## Requirements
-
-- python == 3.7.3
-- pytorch == 1.8.0
-- matplotlib == 3.1.1
-- numpy == 1.19.4
-- pandas == 0.25.1
-- scikit_learn == 0.21.3
-- tqdm == 4.62.3
-- einops == 0.4.0
-
-## Benchmarking
-
-### 1. Data preparation
-
-We follow the same data formatting as the Informer repo (https://github.com/zhouhaoyi/Informer2020), which also hosts the raw data.
-Please put all raw data (csv) files in the ```./data``` folder.
-
-### 2. Run experiments
-
-To replicate our results on the ETT, ECL, Traffic, and WTH datasets, run
-```
-sh run.sh
+```text
+exp/exp_multi_expert.py
+models/ts2vec/fsnet.py
+models/ts2vec/fsnet_.py
 ```
 
+## 滚动延迟反馈
 
-To replicate our results of $D^3A$, run
+启用 `--delay_fb` 后，预测起点仍然每次前进一个时间点。设预测长度为 `H=pred_len`，在线时序为：
+
+```text
+predict origin 0
+predict origin 1
+...
+predict origin H-1
+release/update origin 0
+predict origin H
+release/update origin 1
+predict origin H+1
+...
 ```
-sh run_d3a.sh
+
+这意味着：
+
+- 当前预测窗口的完整未来标签不会立即参与更新；
+- origin `t` 的标签只会在 origin `t+H` 到达后释放；
+- 延迟模式不会再通过 `index * pred_len` 跳过中间窗口；
+- 延迟和非延迟模式评估相同的预测起点，但可用于模型更新的信息不同。
+
+在线测试建议固定 `--test_bsz 1`。
+
+## 已实现方法
+
+| 方法 | `--method` | 本地实现 |
+|---|---|---|
+| Multi-Expert | `multi_expert` | `exp/exp_multi_expert.py` |
+| DynaME | `dyname` | `exp/exp_dyname.py`, `models/dyname.py` |
+| PatchTST-DGrad | `patchtst_dgrad` | `exp/exp_patchtst_dgrad.py`, `models/patchtst_dgrad.py` |
+| Experience Replay | `er` | `exp/exp_er.py`, `models/er.py` |
+| FSNet | `fsnet` | `exp/exp_fsnet.py`, `models/fsnet.py` |
+| OneNet | `onenet` | `exp/exp_onenet.py`, `models/onenet.py` |
+| DSOF | `dsof` | `exp/exp_dsof.py`, `models/dsof.py` |
+| PROCEED | `proceed` | `exp/exp_proceed.py`, `models/proceed.py` |
+
+ER、FSNet、OneNet、DSOF 和 PROCEED 共用 `exp/exp_stream_baselines.py` 中的训练与在线测试框架。
+
+## 环境安装
+
+推荐 Python 3.10。当前环境验证版本为 Python 3.10.20 和 PyTorch 2.11.0+cu128。
+
+```bash
+conda create -n online python=3.10 -y
+conda activate online
+python -m pip install --upgrade pip
+python -m pip install -r requirement.txt
 ```
 
-### 3.  Arguments
+`requirement.txt` 不固定 PyTorch 的 CUDA 构建后缀。使用 GPU 时，可以先安装与本机驱动匹配的 PyTorch，再安装其余依赖。已安装的 `2.x` PyTorch 会满足依赖约束。
 
-You can specify one of the above method via the ```--method``` argument.
+## 数据准备
 
-**Dataset:** Our implementation currently supports the following datasets: Electricity Transformer - ETT (including ETTh1, ETTh2, ETTm1, and ETTm2), ECL, Traffic, and WTH. You can specify the dataset via the ```--data``` argument.
+数据 CSV 不纳入版本控制，需要自行放入 `data/`。主要实验使用以下文件名：
 
-**Other arguments:** Other useful arguments for experiments are:
-- ```--test_bsz```: batch size used for testing: must be set to **1** for online learning,
-- ```--seq_len```: look-back windows' length, set to **60** by default,
-- ```--pred_len```: forecast windows' length, set to **1** for online learning.
-
-
-**D3A Arguments:**
-Here are additional arguments useful for experiments:
-
-- `--sleep_interval`: Corresponds to \( l_w \) in our paper, representing the window size for the drift detector.
-- `--sleep_epochs`: Determines the number of epochs the model should be fully fine-tuned when a drift is detected. It is set to **20** by default.
-- `--online_adjust`: After detecting a drift, the regularization weight \( \lambda \) in our paper is set to **0.5** by default.
-- `--offline_adjust`: During each step, the algorithm samples previous data and augments it for regularization. The regularization weight is set to **0.5** by default.
-- `--alpha_d`: Represents a predefined confidence level for triggering concept drift, set to **0.003** by default.
-
-### 4.  Baselines
-
-**Backbones:** Our implementation supports the following backbones in Table.1:
-
-- patch: PatchTST for online time series forecasting
-- fedformer: FedFormer for online time series forecasting
-- dlinear: DLinear for online time series forecasting
-- cross_former: Crossformer for online time series forecasting
-- naive_time: The proposed Time-TCN for online time series forecasting
-- naive_time: The proposed Time-TCN for online time series forecasting
-
-
-**Ablations:** Our online learning and ensembling ablation baselines in Table.4:
-- fsnet_plus_time: Simple averaging
-- onenet_gate: Gating mechanism
-- onenet_linear_regression: Linear Regression (LR)
-- onenet_egd: Exponentiated Gradient Descent (EGD)
-- onenet_weight: Reinforcement learning to learn the weight directly (RL-W)
-
-**Algorithms:** Our implementation supports the following training strategies in Table.2,3:
-- ogd: OGD training
-- large: OGD training with a large backbone
-- er: experience replay
-- derpp: dark experience replay
-- nomem: FSNET without the associative memory
-- naive: FSNET without both the memory and adapter, directly trains the adaptation coefficients.
-- fsnet: FSNet framework
-- fsnet_d3a: FSNet with Detect-then-Adapt framework
-- fsnet_time: Cross-Time FSNet
-- onenet_minus: the proposed OneNet- in section 4
-- onenet_tcn: the proposed OneNet with tcn backbone
-- onenet_fsnet: the proposed OneNet 
-- onenet_d3a: the proposed OneNet with Detect-then-Adapt framework
-
-
-### 5.  Baselines
-
-## License
-
-This source code is released under the MIT license, included [here](LICENSE).
-
-### Citation 
-If you find this repo useful, please consider citing: 
+```text
+data/
+├── ETTh1.csv
+├── ETTh2.csv
+├── ETTm1.csv
+├── ETTm2.csv
+├── WTH.csv
+└── ECL.csv
 ```
-@inproceedings{
-    zhang2023onenet,
-    title={OneNet: Enhancing Time Series Forecasting Models under Concept Drift by Online Ensembling},
-    author={YiFan Zhang and Qingsong Wen and Xue Wang and Weiqi Chen and Liang Sun and Zhang Zhang and Liang Wang and Rong Jin and Tieniu Tan},
-    booktitle={Thirty-seventh Conference on Neural Information Processing Systems},
-    year={2023}
-}
 
-@misc{zhang2024addressing,
-      title={Addressing Concept Shift in Online Time Series Forecasting: Detect-then-Adapt}, 
-      author={YiFan Zhang and Weiqi Chen and Zhaoyang Zhu and Dalin Qin and Liang Sun and Xue Wang and Qingsong Wen and Zhang Zhang and Liang Wang and Rong Jin},
-      year={2024},
-      eprint={2403.14949},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG}
-}
+CSV 第一列必须是 `date`，其余列为数值变量。`main.py` 中的主要数据映射为：
+
+| 数据集 | 文件名 | M 模式变量数 | 默认目标列 |
+|---|---|---:|---|
+| ETTh1 | `ETTh1.csv` | 7 | `OT` |
+| ETTh2 | `ETTh2.csv` | 7 | `OT` |
+| ETTm1 | `ETTm1.csv` | 7 | `OT` |
+| ETTm2 | `ETTm2.csv` | 7 | `OT` |
+| WTH | `WTH.csv` | 12 | `WetBulbCelsius` |
+| ECL | `ECL.csv` | 321 | `MT_320` |
+
+数据划分定义在 `data/data_loader.py`：
+
+- WTH、ECL 等 `Dataset_Custom` 数据使用 20%/5%/75% 的 train/validation/test 时间划分；
+- 标准化统计量只由训练段拟合；
+- ETT 数据使用 loader 中定义的固定时间边界；
+- train/validation 不受 `delay_fb` 影响；test 始终以 stride=1 生成窗口。
+
+## 运行 Multi-Expert
+
+仓库保留的实验入口为：
+
+```bash
+bash scripts/run_multi_expert.sh
 ```
+
+当前默认运行 4 个数据集 × 3 个预测步长，共 12 个任务：
+
+| 配置 | 默认值 |
+|---|---|
+| 数据集 | ETTh2、ETTm1、WTH、ECL |
+| `seq_len` | 60 |
+| `pred_len` | 1、24、48 |
+| 特征模式 | M |
+| 训练 batch size | 32 |
+| 测试 batch size | 1 |
+| 训练轮数 | 15 |
+| early-stopping patience | 3 |
+| 在线模式 | full |
+| 延迟反馈 | 开启 |
+| 专家数 / top-k | 4 / 4 |
+| 预训练模式 | retrain |
+| 单 GPU 默认并发 | 2 |
+
+脚本优先使用 `PYTHON` 指定的解释器。为了确保使用当前 Conda 环境，推荐：
+
+```bash
+PYTHON="$CONDA_PREFIX/bin/python" \
+GPU_IDS=0 MAX_PER_GPU=2 \
+bash scripts/run_multi_expert.sh
+```
+
+多 GPU 时使用逗号分隔：
+
+```bash
+PYTHON="$CONDA_PREFIX/bin/python" \
+GPU_IDS=0,1 MAX_PER_GPU=1 \
+bash scripts/run_multi_expert.sh
+```
+
+## 直接调用 `main.py`
+
+下面的示例在 WTH 上运行 `pred_len=24` 的完整 Multi-Expert：
+
+```bash
+python -u main.py \
+  --method multi_expert \
+  --root_path ./data/ \
+  --data WTH \
+  --features M \
+  --seq_len 60 \
+  --label_len 0 \
+  --pred_len 24 \
+  --batch_size 32 \
+  --test_bsz 1 \
+  --train_epochs 15 \
+  --patience 3 \
+  --learning_rate_expert 1e-3 \
+  --learning_rate_router 1e-3 \
+  --online_lr_expert 5e-5 \
+  --online_lr_router 1e-5 \
+  --online_learning full \
+  --num_experts 4 \
+  --top_k 4 \
+  --tsb_alpha 0.5 \
+  --tsb_buffer_size 8 \
+  --delay_fb \
+  --pretrain_mode retrain \
+  --itr 1
+```
+
+运行 baseline 时替换 `--method`，并按需要设置对应参数。例如：
+
+```bash
+python -u main.py \
+  --method patchtst_dgrad \
+  --root_path ./data/ \
+  --data WTH \
+  --features M \
+  --seq_len 60 \
+  --label_len 0 \
+  --pred_len 24 \
+  --batch_size 32 \
+  --test_bsz 1 \
+  --train_epochs 15 \
+  --online_learning full \
+  --delay_fb \
+  --patch_len 16 \
+  --stride 8 \
+  --d_model 32 \
+  --n_heads 8 \
+  --e_layers 2 \
+  --d_ff 128 \
+  --revin 1 \
+  --dgrad_online_lr 1e-3 \
+  --itr 1
+```
+
+`--method` 应显式指定为上表中的实现之一。
+
+## 预训练与 checkpoint
+
+默认 `--pretrain_mode retrain` 会先训练模型，再执行在线测试。加载已有权重时使用：
+
+```bash
+python -u main.py \
+  ... \
+  --pretrain_mode load \
+  --pretrained_checkpoint /path/to/checkpoint.pth
+```
+
+常用参数：
+
+| 参数 | 说明 |
+|---|---|
+| `--skip_test` | 只预训练并保存 checkpoint |
+| `--checkpoint_tag` | 为结构或实验变体添加标识 |
+| `--itr` | 重复实验次数 |
+| `--online_learning` | `none`、`full` 或 `regressor` |
+| `--n_inner` | 每个在线样本的内部更新次数 |
+
+## Multi-Expert 参数
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--num_experts` | 4 | 专家数量 |
+| `--top_k` | 4 | 每个通道保留的专家数 |
+| `--lambda_div` | 0.0 | 离线专家多样性损失权重 |
+| `--online_lr_expert` | 1e-4 | 专家在线基础学习率 |
+| `--online_lr_router` | 1e-5 | 路由器在线基础学习率 |
+| `--tsb_alpha` | 0.5 | 当前梯度与参考梯度的平滑系数 |
+| `--tsb_buffer_size` | 8 | 已释放反馈样本缓冲区大小 |
+| `--expert_grad_clip` | 1.0 | 专家梯度裁剪阈值 |
+| `--router_grad_clip` | 0.5 | 路由器梯度裁剪阈值 |
+| `--router_temperature` | 2.0 | 路由 softmax 温度 |
+| `--router_entropy_weight` | 0.001 | 路由熵正则权重 |
+| `--disable_tsb` | false | 完整关闭 TSB |
+| `--online_log_interval` | 500 | 在线诊断日志间隔 |
+
+`--disable_tsb` 会关闭参考梯度、梯度平滑、冲突投影、TSB buffer 和与 TSB 绑定的自适应在线步长，而不只是将 `tsb_alpha` 设为 0。
+
+查看全部参数：
+
+```bash
+python main.py --help
+```
+
+## 输出
+
+以下目录由运行过程生成，并已通过 `.gitignore` 排除：
+
+```text
+checkpoints/<setting>/
+├── checkpoint.pth
+└── optimizer.pth
+
+log/<timestamp>/
+└── *.out
+
+result/resultsN/<setting>/
+├── metrics.npy
+├── mae.npy
+├── mse.npy
+├── preds.npy
+└── trues.npy
+```
+
+`metrics.npy` 依次包含 MAE、MSE、RMSE、MAPE、MSPE 和运行时间；`mae.npy`、`mse.npy` 保存在线累计曲线。
+
+延迟反馈启动时会输出：
+
+```text
+[DELAY_FB] rolling origins; feedback delay=24 steps
+```
+
+Multi-Expert 在线诊断还包含 routed/uniform/expert MSE、最差通道、路由熵、动态学习率和梯度范数。
+
+## 目录结构
+
+仅列出未被 `.gitignore` 排除的项目文件：
+
+```text
+.
+├── data/
+│   └── data_loader.py
+├── exp/
+│   ├── exp_basic.py
+│   ├── exp_multi_expert.py
+│   ├── exp_dyname.py
+│   ├── exp_patchtst_dgrad.py
+│   └── exp_stream_baselines.py
+├── models/
+│   ├── ts2vec/
+│   ├── dyname.py
+│   ├── patchtst_dgrad.py
+│   ├── er.py
+│   ├── fsnet.py
+│   ├── onenet.py
+│   ├── dsof.py
+│   └── proceed.py
+├── scripts/
+│   └── run_multi_expert.sh
+├── utils/
+│   ├── metrics.py
+│   ├── timefeatures.py
+│   └── tools.py
+├── main.py
+├── requirement.txt
+└── README.md
+```
+
+## 常见问题
+
+### 进程显示 `Killed`
+
+通常表示主机内存或 GPU 显存不足。先降低单卡并发：
+
+```bash
+MAX_PER_GPU=1 bash scripts/run_multi_expert.sh
+```
+
+### 延迟反馈为什么比旧的分块方式更慢
+
+当前实现仍评估每一个相邻预测起点，只延迟标签释放，不再跳过 `H-1` 个窗口，因此测试迭代数与完整滚动预测一致。
+
+### 脚本没有使用预期的 Conda 环境
+
+显式设置：
+
+```bash
+PYTHON="$CONDA_PREFIX/bin/python" bash scripts/run_multi_expert.sh
+```
+
+### CUDA 或 PyTorch 版本不匹配
+
+先根据本机 NVIDIA 驱动安装对应的 PyTorch CUDA 构建，再安装 `requirement.txt` 中的其他依赖。
+
+## 上游项目
+
+本仓库的模型设计和本地适配参考了：
+
+- [OneNet](https://github.com/yfzhang114/OneNet)
+- [FSNet](https://github.com/salesforce/fsnet)
+- [OnlineTSF](https://github.com/SJTU-DMTai/OnlineTSF)
+- [DSOF](https://github.com/yyalau/iclr2025_dsof)
+- [DynaME](https://github.com/shhong97/DynaME)
+
+使用相关方法进行论文实验时，请同时引用对应的原始论文和代码仓库。
