@@ -8,6 +8,12 @@ import uuid
 import numpy as np
 import torch
 
+from utils.iteration_diagnostics import (
+    aggregate_online_diagnostics,
+    annotate_iteration_summary,
+    save_prediction_results,
+)
+
 
 # from exp.exp_online import Exp_TS2VecSupervised
 
@@ -27,19 +33,16 @@ def init_dl_program(
         torch.set_num_threads(max_threads)  # intraop
         if torch.get_num_interop_threads() != max_threads:
             torch.set_num_interop_threads(max_threads)  # interop
-        try:
+        if importlib.util.find_spec("mkl") is not None:
             import mkl
-        except:
-            pass
-        else:
             mkl.set_num_threads(max_threads)
 
     if seed is not None:
         random.seed(seed)
-        seed += 1
         np.random.seed(seed)
-        seed += 1
         torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     if isinstance(device_name, (str, int)):
         device_name = [device_name]
@@ -52,9 +55,6 @@ def init_dl_program(
             if t_device.type == 'cuda':
                 assert torch.cuda.is_available()
                 torch.cuda.set_device(t_device)
-                if seed is not None:
-                    seed += 1
-                    torch.cuda.manual_seed(seed)
         devices.reverse()
         torch.backends.cudnn.enabled = use_cudnn
         torch.backends.cudnn.deterministic = deterministic
@@ -120,6 +120,8 @@ def parse_args():
     parser.add_argument('--cols', type=str, nargs='+', help='certain cols from the data files as the input features')
     parser.add_argument('--num_workers', type=int, default=0, help='data loader num workers')
     parser.add_argument('--itr', type=int, default=2, help='experiments times')
+    parser.add_argument('--seed', type=int, default=0,
+                        help='base seed; iteration ii uses seed + ii')
     parser.add_argument('--train_epochs', type=int, default=3, help='train epochs')
     parser.add_argument('--batch_size', type=int, default=32, help='batch size of train input data')
     parser.add_argument('--patience', type=int, default=3, help='early stopping patience')
@@ -364,79 +366,161 @@ def parse_args():
 if __name__ == '__main__':
     args = parse_args()
 
-    # Exp = Exp_TS2VecSupervised
-    Exp = getattr(importlib.import_module('exp.exp_{}'.format(args.method)), 'Exp_TS2VecSupervised')
-
+    Exp = getattr(
+        importlib.import_module('exp.exp_{}'.format(args.method)),
+        'Exp_TS2VecSupervised',
+    )
     metrics, preds, true, mae, mse = [], [], [], [], []
+    diagnostic_summaries = []
+
+    method_name = args.method
+    if args.checkpoint_tag:
+        method_name = '{}_{}'.format(method_name, args.checkpoint_tag)
+    result_setting = '{}_{}_pl{}_ol{}_opt{}_tb{}'.format(
+        method_name,
+        args.data,
+        args.pred_len,
+        args.online_learning,
+        args.opt,
+        args.test_bsz,
+    )
+    result_root = './result/'
+    os.makedirs(result_root, exist_ok=True)
+    next_idx = 1
+    for name in os.listdir(result_root):
+        if name.startswith('results'):
+            index_text = name[len('results'):]
+            if index_text.isdigit():
+                next_idx = max(next_idx, int(index_text) + 1)
+    folder_path = os.path.join(
+        result_root, 'results{}'.format(next_idx), result_setting
+    )
+    os.makedirs(folder_path, exist_ok=True)
 
     for ii in range(args.itr):
         print('\n ====== Run {} ====='.format(ii))
-        # setting record of experiments
-        # method_name = 'ts2vec_finetune' if args.finetune else 'ts2vec_supervised'
-        method_name = args.method
-        if args.checkpoint_tag:
-            method_name = '{}_{}'.format(method_name, args.checkpoint_tag)
         uid = uuid.uuid4().hex[:4]
         suffix = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M") + "_" + uid
-        setting = '{}_{}_pl{}_ol{}_opt{}_tb{}_{}'.format(method_name, args.data, args.pred_len, args.online_learning,
-                                                         args.opt, args.test_bsz, suffix)
+        setting = '{}_{}_pl{}_ol{}_opt{}_tb{}_{}'.format(
+            method_name,
+            args.data,
+            args.pred_len,
+            args.online_learning,
+            args.opt,
+            args.test_bsz,
+            suffix,
+        )
 
-        init_dl_program(args, seed=ii)
-        args.finetune_model_seed = ii
-        exp = Exp(args)  # set experiments
+        iteration_seed = args.seed + ii
+        init_dl_program(args, seed=iteration_seed)
+        args.finetune_model_seed = iteration_seed
+        exp = Exp(args)
         if args.pretrain_mode == 'load':
             if not args.pretrained_checkpoint:
-                raise ValueError('--pretrained_checkpoint is required when --pretrain_mode load')
-            print('>>>>>>>load pretrained checkpoint : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(args.pretrained_checkpoint))
+                raise ValueError(
+                    '--pretrained_checkpoint is required when --pretrain_mode load'
+                )
+            print(
+                '>>>>>>>load pretrained checkpoint : '
+                '{}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(
+                    args.pretrained_checkpoint
+                )
+            )
             exp.load_pretrained(args.pretrained_checkpoint)
         else:
             print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
             exp.train(setting)
 
+        iteration_folder = os.path.join(folder_path, 'itr_{}'.format(ii))
         if args.skip_test:
             print('>>>>>>>testing skipped : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-            metrics.append([np.nan, np.nan, np.nan, np.nan, np.nan, np.nan])
+            iteration_metrics = [np.nan] * 6
+            metrics.append(iteration_metrics)
             mae.append(np.nan)
             mse.append(np.nan)
+            save_prediction_results(
+                iteration_folder,
+                iteration_metrics,
+                np.asarray([]),
+                np.asarray([]),
+                np.asarray(np.nan),
+                np.asarray(np.nan),
+            )
             torch.cuda.empty_cache()
             continue
 
         print('>>>>>>>testing : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
-        m, mae_, mse_, p, t = exp.test(setting)
-        metrics.append(m)
-        # if str(args.data) == 'ECL' or str(args.data) == 'Traffic':
-        #     preds = [0]
-        #     true = [0]
-        # else:
-        #     preds.append(p)
-        #     true.append(t)
-        preds.append(p)
-        true.append(t)
-
-        mae.append(mae_)
-        mse.append(mse_)
+        iteration_metrics, mae_curve, mse_curve, prediction, target = exp.test(
+            setting
+        )
+        metrics.append(iteration_metrics)
+        preds.append(prediction)
+        true.append(target)
+        mae.append(mae_curve)
+        mse.append(mse_curve)
+        save_prediction_results(
+            iteration_folder,
+            iteration_metrics,
+            prediction,
+            target,
+            mae_curve,
+            mse_curve,
+        )
+        if hasattr(exp, 'save_online_diagnostics') and args.progressive_fb:
+            npz_path, json_path = exp.save_online_diagnostics(
+                iteration_folder
+            )
+            metadata = {
+                'index': ii,
+                'seed': iteration_seed,
+                'dataset': args.data,
+                'pred_len': args.pred_len,
+                'expert_update_strategy': args.expert_update_strategy,
+                'processed_origins': getattr(
+                    exp, 'processed_online_origins', None
+                ),
+                'completed_record_count': getattr(
+                    exp, 'completed_record_count', None
+                ),
+                'early_ended': getattr(
+                    exp, 'online_test_early_ended', None
+                ),
+                'strict_checks_enabled': args.strict_online_checks,
+                'strict_checks_passed': (
+                    getattr(exp.online_checker, 'failure_count', 0) == 0
+                ),
+                'strict_check_failure_count': getattr(
+                    exp.online_checker, 'failure_count', 0
+                ),
+                'stable_buffer_capacity': args.stable_buffer_size,
+                'recovery_buffer_capacity': (
+                    0 if args.disable_recovery
+                    else args.recovery_buffer_size
+                ),
+                'subspace_max_rank': args.subspace_max_rank,
+            }
+            annotate_iteration_summary(json_path, metadata)
+            diagnostic_summaries.append(json_path)
+            print('online diagnostics:', npz_path, json_path)
         torch.cuda.empty_cache()
 
-    # folder_path = './results/' + setting + '/'
-    result_root = './result/'
-    if not os.path.exists(result_root):
-        os.makedirs(result_root)
-
-    next_idx = 1
-    for name in os.listdir(result_root):
-        if name.startswith('results'):
-            suffix = name[len('results'):]
-            if suffix.isdigit():
-                next_idx = max(next_idx, int(suffix) + 1)
-
-    folder_path = os.path.join(result_root, 'results{}'.format(next_idx), setting) + '/'
-    if not os.path.exists(folder_path):
-        os.makedirs(folder_path)
-    np.save(folder_path + 'metrics.npy', np.array(metrics))
-    np.save(folder_path + 'preds.npy', np.array(preds))
-    np.save(folder_path + 'trues.npy', np.array(true))
-    np.save(folder_path + 'mae.npy', np.array(mae))
-    np.save(folder_path + 'mse.npy', np.array(mse))
-    if hasattr(exp, 'save_online_diagnostics') and args.progressive_fb:
-        npz_path, json_path = exp.save_online_diagnostics(folder_path)
-        print('online diagnostics:', npz_path, json_path)
+    metrics_array = np.asarray(metrics)
+    np.save(os.path.join(folder_path, 'metrics.npy'), metrics_array)
+    np.save(os.path.join(folder_path, 'preds.npy'), np.asarray(preds))
+    np.save(os.path.join(folder_path, 'trues.npy'), np.asarray(true))
+    np.save(os.path.join(folder_path, 'mae.npy'), np.asarray(mae))
+    np.save(os.path.join(folder_path, 'mse.npy'), np.asarray(mse))
+    np.savez_compressed(
+        os.path.join(folder_path, 'aggregate_metrics.npz'),
+        metrics_mean=np.nanmean(metrics_array, axis=0),
+        metrics_std=np.nanstd(metrics_array, axis=0),
+        metrics=metrics_array,
+    )
+    if diagnostic_summaries:
+        aggregate_online_diagnostics(
+            diagnostic_summaries,
+            os.path.join(
+                folder_path, 'aggregate_diagnostics_summary.json'
+            ),
+        )
+    print('RESULT_DIR: {}'.format(os.path.abspath(folder_path)))

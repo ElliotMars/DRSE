@@ -1,6 +1,5 @@
 import numpy as np
 import numexpr as ne
-import pdb
 
 def cumavg(m):
     cumsum= np.cumsum(m)

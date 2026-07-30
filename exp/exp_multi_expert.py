@@ -630,6 +630,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.credit_diagnostic_total_count = 0
         self.expert_update_count = 0
         self.completed_record_count = 0
+        self.processed_online_origins = 0
+        self.online_test_early_ended = False
         self.last_expert_update_diagnostics: dict[str, Any] = {}
         self.online_checker = StrictOnlineChecker(self.strict_online_checks)
         self._test_start_model_state: dict[str, Any] | None = None
@@ -1274,7 +1276,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
     ) -> dict[str, Any]:
         """Apply plain/TSB first and optional subspace filtering second."""
 
-        diagnostics: dict[str, Any] = {"tsb_conflict_rate": 0.0}
+        diagnostics: dict[str, Any] = {}
         if self.expert_update_strategy in {"tsb", "hybrid"}:
             diagnostics.update(
                 self._apply_tsb_gradient_filter(current, reference, alpha)
@@ -2077,6 +2079,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.credit_diagnostic_total_count = 0
         self.expert_update_count = 0
         self.completed_record_count = 0
+        self.processed_online_origins = 0
+        self.online_test_early_ended = False
         self.last_expert_update_diagnostics = {}
         checker = getattr(self, "online_checker", None)
         if checker is not None:
@@ -2165,6 +2169,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
             mapes.append(mape)
             mspes.append(mspe)
 
+        self.processed_online_origins = processed_origins
+        self.online_test_early_ended = processed_origins < len(test_data)
         preds = torch.cat(preds, dim=0).numpy()
         trues = torch.cat(trues, dim=0).numpy()
         print("test shape:", preds.shape, trues.shape)

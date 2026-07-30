@@ -1,4 +1,3 @@
-import pdb
 from itertools import chain
 
 import torch
@@ -137,8 +136,16 @@ class SamePadConv(nn.Module):
                 w = self.tau * w + (1 - self.tau) * o_w.view(w.size())
                 b = self.tau * b + (1 - self.tau) * o_b.view(b.size())
                 f = self.tau * f + (1 - self.tau) * o_f.view(f.size())
-            except:
-                pdb.set_trace()
+            except (RuntimeError, ValueError) as exc:
+                raise RuntimeError(
+                    "SamePadConv calibration reshape failed: "
+                    f"w_shape={tuple(w.shape)}, b_shape={tuple(b.shape)}, "
+                    f"f_shape={tuple(f.shape)}, "
+                    f"retrieved_w_shape={tuple(o_w.shape)}, "
+                    f"retrieved_b_shape={tuple(o_b.shape)}, "
+                    f"retrieved_f_shape={tuple(o_f.shape)}, "
+                    f"memory_shape={tuple(old_w.shape)}"
+                ) from exc
         f = f.view(-1).unsqueeze(0).unsqueeze(2)
 
         return w.unsqueeze(0), b.view(-1), f
@@ -151,8 +158,16 @@ class SamePadConv(nn.Module):
         try:
             conv_out = F.conv1d(x, cw, padding=self.padding, dilation=self.dilation, bias=self.bias * b)
             out = f * conv_out
-        except:
-            pdb.set_trace()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "SamePadConv calibrated forward failed: "
+                f"input_shape={tuple(x.shape)}, "
+                f"conv_weight_shape={tuple(self.conv.weight.shape)}, "
+                f"calibration_weight_shape={tuple(w.shape)}, "
+                f"calibrated_weight_shape={tuple(cw.shape)}, "
+                f"bias_shape={tuple(b.shape)}, "
+                f"feature_scale_shape={tuple(f.shape)}"
+            ) from exc
         return out
 
     def representation(self, x):

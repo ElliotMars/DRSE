@@ -86,16 +86,10 @@ class OnlineDiagnosticsRecorder:
         keys = sorted({key for record in self.records for key in record})
         arrays: dict[str, np.ndarray] = {}
         for key in keys:
-            exemplar = next(
-                np.asarray(record[key])
-                for record in self.records
-                if key in record
-            )
             values = [
                 np.asarray(record[key])
-                if key in record
-                else np.full(exemplar.shape, np.nan, dtype=np.float64)
                 for record in self.records
+                if key in record
             ]
             arrays[key] = self._stack(values)
         return arrays

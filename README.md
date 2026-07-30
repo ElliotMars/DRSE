@@ -334,6 +334,7 @@ python -u main.py \
 | `--credit_diagnostic_buffer_size` | 10000 | 内存中保留的 record 级 credit 诊断上限 |
 | `--max_online_steps` | -1 | smoke test 最大 online origin 数；-1 不限制 |
 | `--strict_online_checks` | false | 开启高开销在线有限性、归一化、生命周期和顺序检查 |
+| `--seed` | 0 | iteration 基础随机种子；第 `ii` 次使用 `seed + ii` |
 
 `--disable_tsb` 会关闭参考梯度、梯度平滑、冲突投影、TSB buffer 和与 TSB 绑定的自适应在线步长，而不只是将 `tsb_alpha` 设为 0。
 
@@ -376,17 +377,32 @@ log/<timestamp>/
 └── *.out
 
 result/resultsN/<setting>/
+├── itr_0/
+│   ├── metrics.npy
+│   ├── mae.npy
+│   ├── mse.npy
+│   ├── preds.npy
+│   ├── trues.npy
+│   ├── online_diagnostics.npz
+│   ├── credit_diagnostics.npz
+│   └── online_diagnostics_summary.json
+├── itr_1/
+│   └── ...
 ├── metrics.npy
 ├── mae.npy
 ├── mse.npy
 ├── preds.npy
 ├── trues.npy
-├── online_diagnostics.npz
-├── credit_diagnostics.npz
-└── online_diagnostics_summary.json
+├── aggregate_metrics.npz
+└── aggregate_diagnostics_summary.json
 ```
 
-`metrics.npy` 依次包含 MAE、MSE、RMSE、MAPE、MSPE 和运行时间；`mae.npy`、`mse.npy` 保存在线累计曲线。
+每个 iteration 都写入稳定编号的 `itr_N` 目录，`itr=1` 也使用
+`itr_0`。目录内沿用原来的预测文件名；顶层 `metrics.npy` 等文件继续
+保存所有 iteration，供旧的结果读取代码使用。`aggregate_metrics.npz`
+保存指标 mean/std；`aggregate_diagnostics_summary.json` 只读取各
+iteration 的 summary JSON 汇总，不加载逐步 NPZ。随机种子为
+`iteration_seed = seed + ii`，并写入对应 summary。
 
 延迟反馈启动时会输出：
 
@@ -395,6 +411,38 @@ result/resultsN/<setting>/
 ```
 
 Progressive Multi-Expert 诊断按 `online_log_interval` 聚合，包含 MSE、prior/effective entropy、`z` norm、Expert 权重与独立 MSE、责任与版本漂移、buffer 生命周期、Recovery 成功率、subspace rank/energy/drift、平行/正交梯度、gamma、TSB conflict rate 和 Router Gap。控制台只保留稀疏摘要。区间数组写入 `online_diagnostics.npz`；bounded record 级 JS divergence、ranking reversal、alignment、confidence 和 Expert update count 写入 `credit_diagnostics.npz`；summary 同时报告累计 record 数、实际保留数与估算覆盖数。
+
+跨 iteration summary 对存在的字段计算 mean/std，包括 online MSE、
+Router Gap、JS divergence、ranking reversal、capability alignment、
+Stable/Recovery 平均大小、Recovery 成功率与生命周期计数、subspace
+rank/energy、`z` norm 以及适用时的 TSB conflict rate。策略不产生的
+字段保留为 `null`，不会用 0 伪造。
+
+### Progressive 真实数据 smoke test
+
+独立 smoke 脚本不会改变正式实验脚本的默认参数：
+
+```bash
+DATASET=ETTh2 \
+PRED_LEN=24 \
+MAX_ONLINE_STEPS=200 \
+STRICT_ONLINE_CHECKS=1 \
+bash scripts/smoke_test_progressive.sh
+```
+
+默认使用小 Stable/Recovery buffer、较低 subspace rank、`subspace`
+更新、`horizon_channel` Router、top-k 4、200 个 origin 和 `itr=1`。
+所有配置均可由同名环境变量覆盖。`PRETRAIN_MODE=load` 时必须存在
+兼容 checkpoint，可用 `CHECKPOINT=/path/to/checkpoint.pth` 显式指定；
+旧的 channel Router checkpoint 应同时设置
+`ROUTER_GRANULARITY=channel`。`PRETRAIN_MODE=retrain` 会明确打印无
+checkpoint 模式。
+
+脚本以前台方式运行并写独立日志，完成后自动调用
+`scripts/check_smoke_results.py`。检查器支持输入顶层结果目录或单个
+`itr_N` 目录，验证必需文件、有限数值、熵、`z`、alignment/JS/ranking
+范围、buffer 容量、subspace rank/energy、成熟 record 理论上界和
+strict failure count；成功时输出 `Smoke test diagnostics: PASS`。
 
 ## 目录结构
 

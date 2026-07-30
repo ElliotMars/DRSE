@@ -16,6 +16,7 @@ class StrictOnlineChecker:
         self.reset()
 
     def reset(self) -> None:
+        self.failure_count = 0
         self.completed_origins: set[int] = set()
         self.updated_origins: set[int] = set()
         self.committed_origins: set[int] = set()
@@ -33,6 +34,7 @@ class StrictOnlineChecker:
         channel: int = -1,
         expert: int = -1,
     ) -> None:
+        self.failure_count += 1
         raise RuntimeError(
             "strict online check failed: {} "
             "(origin={}, horizon={}, channel={}, expert={})".format(
