@@ -94,6 +94,43 @@ def compute_sample_credit(
     )
 
 
+def full_router_objective(
+    dense_prior: torch.Tensor,
+    effective_weights: torch.Tensor,
+    expert_prediction: torch.Tensor,
+    target: torch.Tensor,
+    entropy_weight: float,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Full-feedback Router objective with detached Expert predictions."""
+
+    if dense_prior.ndim != 4:
+        raise ValueError("dense_prior must have shape [B,H,C,E]")
+    if effective_weights.shape != dense_prior.shape:
+        raise ValueError("effective_weights must match dense_prior")
+    if expert_prediction.shape != dense_prior.shape:
+        raise ValueError("expert_prediction must match dense_prior")
+    if target.shape != dense_prior.shape[:-1]:
+        raise ValueError("target must have shape [B,H,C]")
+    prediction = (effective_weights * expert_prediction.detach()).sum(dim=-1)
+    mixture_loss = (prediction - target).pow(2).mean()
+    if entropy_weight != 0.0:
+        entropy = -(
+            dense_prior.clamp_min(eps)
+            * dense_prior.clamp_min(eps).log()
+        ).sum(dim=-1).mean()
+    else:
+        with torch.no_grad():
+            detached = dense_prior.detach().clamp_min(eps)
+            entropy = -(detached * detached.log()).sum(dim=-1).mean()
+    total = mixture_loss - float(entropy_weight) * entropy
+    return total, {
+        "mixture_loss": mixture_loss,
+        "entropy": entropy,
+        "prediction": prediction,
+    }
+
+
 def partial_router_objective(
     current_prior: torch.Tensor,
     correction: torch.Tensor,
@@ -104,6 +141,7 @@ def partial_router_objective(
     local_credit_weight: float,
     entropy_weight: float,
     eps: float = 1e-8,
+    top_k: int | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Router loss over only the horizon positions that matured now."""
 
@@ -128,6 +166,16 @@ def partial_router_objective(
     effective_weights = torch.softmax(
         torch.log(current_prior.clamp_min(eps)) + correction.detach(), dim=-1
     )
+    if top_k is not None and top_k < current_prior.shape[-1]:
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        values, indices = torch.topk(effective_weights, k=top_k, dim=-1)
+        sparse = torch.zeros_like(effective_weights).scatter(
+            -1, indices, values
+        )
+        effective_weights = sparse / sparse.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(eps)
     mixture = (effective_weights * expert_prediction.detach()).sum(dim=-1)
     partial_mix_loss = (mixture - target).pow(2).mean()
     local_ce = -(
@@ -135,10 +183,15 @@ def partial_router_objective(
         * torch.log(current_prior.clamp_min(eps))
     ).sum(dim=-1)
     local_credit_loss = (local_confidence.detach() * local_ce).mean()
-    entropy = -(
-        current_prior.clamp_min(eps)
-        * torch.log(current_prior.clamp_min(eps))
-    ).sum(dim=-1).mean()
+    if entropy_weight != 0.0:
+        entropy = -(
+            current_prior.clamp_min(eps)
+            * torch.log(current_prior.clamp_min(eps))
+        ).sum(dim=-1).mean()
+    else:
+        with torch.no_grad():
+            detached = current_prior.detach().clamp_min(eps)
+            entropy = -(detached * detached.log()).sum(dim=-1).mean()
     total = (
         partial_mix_loss
         + local_credit_weight * local_credit_loss

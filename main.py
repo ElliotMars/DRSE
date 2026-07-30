@@ -239,6 +239,7 @@ def parse_args():
     parser.add_argument('--robust_fallback_threshold', type=float, default=0.0,
                         help='deprecated compatibility option; v3 only replaces non-finite predictions')
     parser.add_argument('--online_log_interval', type=int, default=500)
+    parser.add_argument('--credit_diagnostic_buffer_size', type=int, default=10000)
     # DynaME baseline
     parser.add_argument('--dyname_period_num', type=int, default=2)
     parser.add_argument('--dyname_krr_lambda', type=float, default=1e-4)

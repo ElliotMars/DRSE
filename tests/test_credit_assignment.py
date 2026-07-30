@@ -7,6 +7,7 @@ from exp.exp_multi_expert import Exp_TS2VecSupervised
 from utils.credit_assignment import (
     compute_local_credit,
     compute_sample_credit,
+    full_router_objective,
     partial_router_objective,
 )
 from utils.online_routing import OnlineRoutingCorrection
@@ -196,3 +197,48 @@ def test_partial_router_update_changes_only_matured_horizon_and_not_z() -> None:
     assert torch.equal(experiment.model.logits[2], logits_before[2])
     assert torch.equal(experiment.routing_correction.z, z_before)
 
+
+
+def test_full_router_entropy_objective_sign_and_gradient_isolation() -> None:
+    logits = torch.nn.Parameter(torch.tensor([[[[1.0, -0.5]]]]))
+    dense_prior = torch.softmax(logits, dim=-1)
+    expert_prediction = torch.tensor(
+        [[[[0.0, 2.0]]]], requires_grad=True
+    )
+    target = torch.tensor([[[0.5]]])
+
+    plain, plain_parts = full_router_objective(
+        dense_prior, dense_prior, expert_prediction, target,
+        entropy_weight=0.0,
+    )
+    regularized, regularized_parts = full_router_objective(
+        dense_prior, dense_prior, expert_prediction, target,
+        entropy_weight=0.2,
+    )
+
+    assert torch.allclose(plain, plain_parts["mixture_loss"])
+    assert torch.allclose(
+        regularized,
+        regularized_parts["mixture_loss"] - 0.2 * regularized_parts["entropy"],
+    )
+    assert regularized < regularized_parts["mixture_loss"]
+    regularized.backward()
+    assert logits.grad is not None and logits.grad.abs().sum() > 0
+    assert expert_prediction.grad is None
+
+
+def test_partial_entropy_weight_zero_matches_unregularized_loss() -> None:
+    prior = torch.tensor([[[0.7, 0.3]]], requires_grad=True)
+    total, parts = partial_router_objective(
+        current_prior=prior,
+        correction=torch.zeros_like(prior),
+        expert_prediction=torch.tensor([[[0.0, 1.0]]]),
+        target=torch.tensor([[0.5]]),
+        local_responsibility=torch.tensor([[[0.6, 0.4]]]),
+        local_confidence=torch.ones(1, 1),
+        local_credit_weight=0.0,
+        entropy_weight=0.0,
+    )
+
+    assert torch.allclose(total, parts["partial_mix_loss"])
+    assert not parts["entropy"].requires_grad

@@ -248,6 +248,7 @@ class ExpertMemoryManager:
             for item in buffer.items
         ]
 
+        demotions: List[Tuple[int, VersionedMemoryItem]] = []
         for expert_id, item in stable_snapshots:
             if not self.stable_buffers[expert_id].contains(item.sample_id):
                 continue
@@ -260,11 +261,26 @@ class ExpertMemoryManager:
                 1.0 - item.last_alignment
             )
             if item.last_alignment < self.alignment_threshold:
-                if self.recovery_buffers[expert_id].add(item):
-                    self.stable_buffers[expert_id].remove(item.sample_id)
-                    stats["stable_to_recovery"] += 1
+                demotions.append((expert_id, item))
 
+        # Remove first, then migrate.  If Recovery rejects the item, it is
+        # evicted rather than incorrectly remaining in Stable.
+        for expert_id, item in demotions:
+            removed = self.stable_buffers[expert_id].remove(item.sample_id)
+            if removed is None:
+                continue
+            self.recovery_buffers[expert_id].remove(item.sample_id)
+            if self.recovery_buffers[expert_id].add(removed):
+                stats["stable_to_recovery"] += 1
+            else:
+                stats["evicted"] += 1
+
+        demoted_keys = {
+            (expert_id, item.sample_id) for expert_id, item in demotions
+        }
         for expert_id, item in recovery_snapshots:
+            if (expert_id, item.sample_id) in demoted_keys:
+                continue
             if not self.recovery_buffers[expert_id].contains(item.sample_id):
                 continue
             alignment, prediction_loss = evaluator(expert_id, item)

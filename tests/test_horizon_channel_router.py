@@ -47,10 +47,13 @@ def test_horizon_channel_prior_shape_and_top_k() -> None:
     x_mark = torch.zeros(5, 7, 7)
 
     prior = model._compute_prior(x, x_mark)
+    gates = model._compute_gates(x, x_mark)
 
     assert prior.shape == (5, 3, 2, 3)
-    assert torch.equal((prior > 0).sum(dim=-1), torch.full((5, 3, 2), 2))
+    assert torch.equal((prior > 0).sum(dim=-1), torch.full((5, 3, 2), 3))
     assert torch.allclose(prior.sum(dim=-1), torch.ones(5, 3, 2))
+    assert torch.equal((gates > 0).sum(dim=-1), torch.full((5, 3, 2), 2))
+    assert torch.allclose(gates.sum(dim=-1), torch.ones(5, 3, 2))
 
 
 def test_horizon_channel_aggregation_matches_manual_result() -> None:

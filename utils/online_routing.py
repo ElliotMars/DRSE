@@ -55,7 +55,11 @@ class OnlineRoutingCorrection:
         self._last_decay_origin = origin
         self._check_finite("decayed correction")
 
-    def effective_weights(self, prior: torch.Tensor) -> torch.Tensor:
+    def effective_weights(
+        self, prior: torch.Tensor, top_k: Optional[int] = None
+    ) -> torch.Tensor:
+        """Apply dense correction before optional top-k sparsification."""
+
         prior_device = prior.to(self.device)
         if tuple(prior_device.shape) == self.shape:
             correction = self.z
@@ -70,9 +74,16 @@ class OnlineRoutingCorrection:
                 f"{tuple(prior_device.shape)}"
             )
         self._check_tensor_finite(prior_device, "router prior")
-        return torch.softmax(
+        corrected = torch.softmax(
             torch.log(prior_device.clamp_min(self.eps)) + correction, dim=-1
         )
+        if top_k is None or top_k >= self.shape[-1]:
+            return corrected
+        if top_k <= 0:
+            raise ValueError("top_k must be positive")
+        values, indices = torch.topk(corrected, k=int(top_k), dim=-1)
+        sparse = torch.zeros_like(corrected).scatter(-1, indices, values)
+        return sparse / sparse.sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
     def update(
         self,

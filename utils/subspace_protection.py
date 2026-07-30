@@ -107,18 +107,20 @@ class RegressorSubspaceProtector:
             return 0
         if self.rank > 0:
             return min(self.rank, available)
-        energy = eigenvalues[:available].clamp_min(0.0)
-        total = energy.sum()
+        positive_energy = eigenvalues[:positive].clamp_min(0.0)
+        total = positive_energy.sum()
         if not bool(torch.isfinite(total).item()) or float(total.item()) <= self.eps:
             return 0
-        cumulative = torch.cumsum(energy, dim=0) / total
-        selected = int(
-            torch.searchsorted(
-                cumulative,
-                torch.tensor(self.energy_threshold, device=cumulative.device),
-            ).item()
-        ) + 1
-        return min(selected, available)
+        cumulative = torch.cumsum(
+            positive_energy[:available], dim=0
+        ) / total
+        threshold = torch.tensor(
+            self.energy_threshold, device=cumulative.device
+        )
+        reached = torch.nonzero(cumulative >= threshold, as_tuple=False)
+        if reached.numel() == 0:
+            return available
+        return int(reached[0].item()) + 1
 
     @staticmethod
     def _basis_drift(old_basis: torch.Tensor, new_basis: torch.Tensor) -> float:
@@ -154,22 +156,35 @@ class RegressorSubspaceProtector:
             return False
         if not bool(torch.isfinite(features).all().item()):
             return False
-        weights = observation_weights.to(features).clamp_min(0.0)
+        weights = observation_weights.to(features)
         if not bool(torch.isfinite(weights).all().item()):
             return False
+        if bool((weights < 0).any().item()):
+            raise ValueError("observation_weights must be non-negative")
         evidence_mass = weights.sum()
-        if float(evidence_mass.item()) <= self.eps:
+        if (
+            not bool(torch.isfinite(evidence_mass).item())
+            or float(evidence_mass.item()) <= self.eps
+        ):
             return False
 
-        mean = (features * weights.unsqueeze(-1)).sum(dim=0) / evidence_mass
-        centered = features - mean
-        covariance = centered.T @ (centered * weights.unsqueeze(-1))
+        # Preserve repeated activation directions with an uncentered weighted
+        # second moment; mean subtraction would erase identical features.
+        weighted_features = features * weights.unsqueeze(-1)
+        covariance = features.T @ weighted_features
         covariance = covariance / evidence_mass.clamp_min(self.eps)
         covariance = 0.5 * (covariance + covariance.T)
         self.last_covariance_shape = tuple(covariance.shape)
         if self.last_covariance_shape != (self.feature_dim, self.feature_dim):
             raise RuntimeError("subspace covariance has an invalid shape")
         if not bool(torch.isfinite(covariance).all().item()):
+            return False
+        if not torch.allclose(
+            covariance,
+            covariance.T,
+            atol=max(10.0 * self.eps, 1e-7),
+            rtol=1e-5,
+        ):
             return False
 
         eigenvalues, eigenvectors = torch.linalg.eigh(covariance)

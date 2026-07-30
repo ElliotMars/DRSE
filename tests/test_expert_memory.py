@@ -1,5 +1,6 @@
 import torch
 
+from exp.exp_multi_expert import Exp_TS2VecSupervised
 from utils.expert_memory import (
     ExpertMemoryManager,
     FixedCapacityExpertBuffer,
@@ -128,3 +129,67 @@ def test_recovery_item_is_evicted_after_attempt_limit() -> None:
     assert first["evicted"] == 0
     assert second["evicted"] == 1
     assert len(manager.recovery_buffers[0]) == 0
+
+
+def test_failed_stable_demotion_is_evicted_not_left_stable() -> None:
+    manager = _manager()
+    manager.add_candidate(_item(1, 0.9, 0.9, torch.tensor([1.0, 0.0, 0.0])))
+    manager.add_candidate(_item(2, 0.9, 0.1, torch.tensor([0.0, 1.0, 0.0])))
+    manager.add_candidate(_item(3, 0.8, 0.1, torch.tensor([0.0, 0.0, 1.0])))
+
+    stats = manager.refresh(
+        lambda expert_id, item: (0.6, 1.0) if item.sample_id == 1 else (0.1, 1.0),
+        timestamp=10,
+        count_recovery_attempts=False,
+    )
+
+    assert stats["stable_to_recovery"] == 0
+    assert stats["evicted"] == 1
+    assert not manager.stable_buffers[0].contains(1)
+    assert not manager.recovery_buffers[0].contains(1)
+
+
+def test_successful_stable_demotion_has_no_duplicate_sample_id() -> None:
+    manager = _manager()
+    manager.add_candidate(_item(1, 0.9, 0.9, torch.tensor([1.0, 0.0])))
+
+    stats = manager.refresh(
+        lambda expert_id, item: (0.4, 1.0),
+        timestamp=10,
+        count_recovery_attempts=False,
+    )
+
+    ids = [item.sample_id for item in manager.all_items()]
+    assert stats["stable_to_recovery"] == 1
+    assert ids.count(1) == 1
+    assert not manager.stable_buffers[0].contains(1)
+    assert manager.recovery_buffers[0].contains(1)
+
+
+def test_recovery_replay_deduplicates_sample_across_experts() -> None:
+    manager = ExpertMemoryManager(
+        num_experts=2, stable_capacity=1, recovery_capacity=2,
+        responsibility_threshold=0.0, alignment_threshold=0.7,
+        duplicate_threshold=0.95, failure_penalty=0.5,
+        max_recovery_attempts=2, storage_dtype="fp16",
+    )
+    first = _item(7, 0.9, 0.2, torch.tensor([1.0, 0.0]))
+    second = _item(7, 0.8, 0.3, torch.tensor([0.0, 1.0]))
+    first.expert_id = 0
+    second.expert_id = 1
+    assert manager.recovery_buffers[0].add(first)
+    assert manager.recovery_buffers[1].add(second)
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.recovery_enabled = True
+    experiment.recovery_batch_size = 1
+    experiment.recovery_loss_weight = 1.0
+    experiment.memory_manager = manager
+    experiment.model = type("Model", (), {"num_experts": 2})()
+    experiment.device = torch.device("cpu")
+
+    batches = experiment._sample_recovery_batches()
+    sampled_ids = [
+        item.sample_id for batch in batches for item in batch["items"]
+    ]
+
+    assert sampled_ids == [7]

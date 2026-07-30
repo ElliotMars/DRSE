@@ -1,4 +1,5 @@
 import copy
+import json
 import math
 import os
 import time
@@ -22,6 +23,7 @@ from exp.exp_basic import Exp_Basic
 from models.ts2vec.fsnet import TSEncoder
 from utils.credit_assignment import (
     compute_sample_credit,
+    full_router_objective,
     jensen_shannon_divergence,
     partial_router_objective,
 )
@@ -290,9 +292,16 @@ class net(nn.Module):
             x.shape[0], self.c_out, self.num_experts
         )
         if self.router_granularity == "channel":
-            prior = torch.softmax(channel_logits / self.router_temperature, dim=-1)
-            assert prior.shape == (x.shape[0], self.c_out, self.num_experts)
-            return self._sparsify_prior(prior)
+            channel_prior = torch.softmax(
+                channel_logits / self.router_temperature, dim=-1
+            )
+            prior = channel_prior.unsqueeze(1).expand(
+                x.shape[0], self.pred_len, self.c_out, self.num_experts
+            )
+            assert prior.shape == (
+                x.shape[0], self.pred_len, self.c_out, self.num_experts
+            )
+            return prior
 
         assert self.horizon_head is not None and self.horizon_bias is not None
         horizon_logits = self.horizon_head(route_feature).reshape(
@@ -307,7 +316,7 @@ class net(nn.Module):
         assert prior.shape == (
             x.shape[0], self.pred_len, self.c_out, self.num_experts
         )
-        return self._sparsify_prior(prior)
+        return prior
 
     def _apply_online_correction(
         self,
@@ -334,13 +343,19 @@ class net(nn.Module):
                 f"prior/correction shape mismatch: {tuple(prior.shape)} vs "
                 f"{tuple(correction.shape)}"
             )
-        return torch.softmax(torch.log(prior.clamp_min(eps)) + correction, dim=-1)
+        corrected = torch.softmax(
+            torch.log(prior.clamp_min(eps)) + correction, dim=-1
+        )
+        return self._sparsify_prior(corrected)
 
     def _compute_gates(
         self, x: torch.Tensor, x_mark: torch.Tensor
     ) -> torch.Tensor:
-        """Backward-compatible wrapper for legacy call sites."""
-        return self._compute_prior(x, x_mark)
+        """Return effective gates while preserving legacy channel shape."""
+        effective = self._sparsify_prior(self._compute_prior(x, x_mark))
+        if self.router_granularity == "channel":
+            return effective[:, 0]
+        return effective
 
     def _prepare_expert_input(self, expert, x, x_mark):
         # FSNet-Time applies masks in-place, so each expert gets an isolated input.
@@ -601,7 +616,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.diagnostics = OnlineDiagnosticsRecorder(
             self.model.num_experts, self.online_log_interval
         )
-        self.credit_diagnostics: List[dict] = []
+        self.credit_diagnostic_buffer_size = max(
+            1, int(getattr(args, "credit_diagnostic_buffer_size", 10000))
+        )
+        self.credit_diagnostics = deque(
+            maxlen=self.credit_diagnostic_buffer_size
+        )
+        self.credit_diagnostic_total_count = 0
         self.expert_update_count = 0
         self.completed_record_count = 0
         self.last_expert_update_diagnostics: dict[str, Any] = {}
@@ -931,7 +952,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return F.normalize(sketch, p=2, dim=-1, eps=self.min_credit_eps)
 
     def _sample_recovery_batches(self) -> List[dict[str, Any]]:
-        """Sample at most one copy of each Recovery item per Expert update."""
+        """Sample each sample ID at most once across all Experts per update."""
 
         if (
             not self.recovery_enabled
@@ -940,11 +961,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
         ):
             return []
         batches: List[dict[str, Any]] = []
+        excluded_sample_ids: set[int] = set()
         for expert_id in range(self.model.num_experts):
             items = self.memory_manager.sample_recovery(
                 expert_id,
                 self.recovery_batch_size,
-                excluded_sample_ids=set(),
+                excluded_sample_ids=excluded_sample_ids,
             )
             if not items:
                 continue
@@ -1277,9 +1299,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
             prior = self.model._compute_prior(x, x_mark)
             horizon_prior = self._horizon_prior(prior)
             effective_weights = (
-                self.routing_correction.effective_weights(horizon_prior)
+                self.routing_correction.effective_weights(
+                    horizon_prior, top_k=self.model.top_k
+                )
                 if self.online_correction_enabled
-                else horizon_prior
+                else self.model._sparsify_prior(horizon_prior)
             )
             outputs, representations = self.model.forward_experts(
                 x, x_mark, return_repr=True
@@ -1393,6 +1417,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 local_credit_weight=self.local_credit_weight,
                 entropy_weight=self.router_entropy_weight,
                 eps=self.min_credit_eps,
+                top_k=getattr(self.model, "top_k", self.model.num_experts),
             )
         loss_router.backward()
         router_grad_norm = nn.utils.clip_grad_norm_(
@@ -1480,10 +1505,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "ranking_reversal": ranking_reversal,
             "capability_alignment": alignment.detach().cpu().tolist(),
             "capability_l2_distance": sketch_l2.detach().cpu().tolist(),
+            "sample_confidence": float(record.sample_confidence),
             "horizon_delay": int(current_origin - record.origin),
+            "pred_len": int(self.args.pred_len),
             "expert_update_count": int(self.expert_update_count),
         }
         self.credit_diagnostics.append(diagnostic)
+        self.credit_diagnostic_total_count += 1
         record.metadata["version_diagnostic"] = diagnostic
         sample_entropy = -(
             prediction_responsibility.clamp_min(self.min_credit_eps)
@@ -1880,6 +1908,33 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
 
+    def _reset_progressive_online_state(
+        self, feedback_manager: ProgressiveFeedbackManager
+    ) -> None:
+        """Reset mutable stream state without changing weights or optimizer state."""
+
+        self.online_buffer.clear()
+        self.online_step = 0
+        self.prev_online_mse = None
+        self.online_mse_ema = None
+        self.fallback_count = 0
+        self.fallback_channel_count = 0
+        feedback_manager.reset()
+        self.routing_correction.reset()
+        self.memory_manager.clear()
+        self.subspace_protector.reset()
+        self.diagnostics.reset()
+        self.progressive_origin = 0
+        self.credit_diagnostics.clear()
+        self.credit_diagnostic_total_count = 0
+        self.expert_update_count = 0
+        self.completed_record_count = 0
+        self.last_expert_update_diagnostics = {}
+        self.opt_expert.zero_grad(set_to_none=True)
+        self.opt_router.zero_grad(set_to_none=True)
+        self.diagnostics.update(**self.subspace_protector.metrics())
+        self._update_memory_diagnostics()
+
     def test(self, setting):
         test_data, test_loader = self._get_data(flag="test")
 
@@ -1904,16 +1959,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 sample_credit_temperature=self.sample_credit_temperature,
                 min_credit_eps=self.min_credit_eps,
             )
-            self.routing_correction.reset()
-            self.memory_manager.clear()
-            self.subspace_protector.reset()
-            self.diagnostics.reset()
-            self.diagnostics.update(**self.subspace_protector.metrics())
-            self._update_memory_diagnostics()
-            self.progressive_origin = 0
-            self.credit_diagnostics.clear()
-            self.expert_update_count = 0
-            self.completed_record_count = 0
+            self._reset_progressive_online_state(progressive_manager)
             print(
                 "[PROGRESSIVE_FB] rolling origins; one newly observed timestamp "
                 "is released before each prediction"
@@ -1977,9 +2023,68 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return [mae, mse, rmse, mape, mspe, exp_time], MAE, MSE, preds, trues
 
     def save_online_diagnostics(self, result_directory: str) -> tuple[str, str]:
-        """Persist interval diagnostics in the setting result directory."""
+        """Persist interval and bounded record-level credit diagnostics."""
 
-        return self.diagnostics.save(result_directory)
+        npz_path, json_path = self.diagnostics.save(result_directory)
+        records = list(self.credit_diagnostics)
+        fields = {
+            "origin": np.asarray([r["origin"] for r in records], dtype=np.int64),
+            "horizon_delay": np.asarray(
+                [r["horizon_delay"] for r in records], dtype=np.int64
+            ),
+            "pred_len": np.asarray(
+                [r.get("pred_len", r["horizon_delay"]) for r in records],
+                dtype=np.int64,
+            ),
+            "js_divergence": np.asarray(
+                [r["js_divergence"] for r in records], dtype=np.float64
+            ),
+            "ranking_reversal": np.asarray(
+                [r["ranking_reversal"] for r in records], dtype=np.bool_
+            ),
+            "mean_alignment": np.asarray(
+                [np.mean(r["capability_alignment"]) for r in records],
+                dtype=np.float64,
+            ),
+            "min_alignment": np.asarray(
+                [np.min(r["capability_alignment"]) for r in records],
+                dtype=np.float64,
+            ),
+            "sample_confidence": np.asarray(
+                [r["sample_confidence"] for r in records], dtype=np.float64
+            ),
+            "expert_update_count": np.asarray(
+                [r["expert_update_count"] for r in records], dtype=np.int64
+            ),
+        }
+        credit_path = os.path.join(result_directory, "credit_diagnostics.npz")
+        np.savez_compressed(credit_path, **fields)
+        with open(json_path, "r", encoding="utf-8") as handle:
+            summary = json.load(handle)
+        retained = len(records)
+        summary["credit_diagnostics"] = {
+            "total_records": int(self.credit_diagnostic_total_count),
+            "retained_records": retained,
+            "estimated_overwritten": max(
+                0, int(self.credit_diagnostic_total_count) - retained
+            ),
+            "mean_js_divergence": (
+                float(fields["js_divergence"].mean()) if retained else None
+            ),
+            "ranking_reversal_rate": (
+                float(fields["ranking_reversal"].mean()) if retained else None
+            ),
+            "mean_alignment": (
+                float(fields["mean_alignment"].mean()) if retained else None
+            ),
+            "min_alignment": (
+                float(fields["min_alignment"].min()) if retained else None
+            ),
+            "file": os.path.basename(credit_path),
+        }
+        with open(json_path, "w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2)
+        return npz_path, json_path
 
     def _process_one_batch(self, dataset_object, batch_x, batch_y, batch_x_mark, batch_y_mark, mode="train"):
         if mode == "test":
@@ -2120,13 +2225,27 @@ class Exp_TS2VecSupervised(Exp_Basic):
             outputs = self.model.forward_experts(
                 x_t, x_mark_t, return_repr=False
             ).detach()
-        gates = self.model._compute_gates(x_t, x_mark_t)
-        prediction = self.model.aggregate_with_gates(gates, outputs)
-        entropy = -(
-            gates.clamp_min(self.min_credit_eps)
-            * gates.clamp_min(self.min_credit_eps).log()
-        ).sum(dim=-1).mean()
-        loss = self._select_criterion()(prediction, y_t)
+        dense_prior = self.model._compute_prior(x_t, x_mark_t)
+        effective_weights = self.model._sparsify_prior(dense_prior)
+        expert_hce = outputs.reshape(
+            outputs.shape[0],
+            self.model.num_experts,
+            self.args.pred_len,
+            self.args.c_out,
+        ).permute(0, 2, 3, 1)
+        target_hc = y_t.reshape(
+            y_t.shape[0], self.args.pred_len, self.args.c_out
+        )
+        loss, components = full_router_objective(
+            dense_prior=dense_prior,
+            effective_weights=effective_weights,
+            expert_prediction=expert_hce,
+            target=target_hc,
+            entropy_weight=self.router_entropy_weight,
+            eps=self.min_credit_eps,
+        )
+        prediction = components["prediction"].reshape(y_t.shape)
+        entropy = components["entropy"]
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("full-feedback Router loss is not finite")
         loss.backward()

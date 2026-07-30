@@ -116,3 +116,47 @@ def test_ecl_channel_features_only_build_320_covariance() -> None:
     )
     assert protector.last_covariance_shape == (320, 320)
     assert protector.states[0].effective_rank == 4
+
+
+def test_identical_features_keep_their_activation_direction() -> None:
+    protector = _protector(rank=0, energy_threshold=0.99)
+    direction = torch.tensor([1.0, 2.0, -1.0, 0.5])
+    features = direction.repeat(6, 1)
+
+    assert protector.refresh_expert(
+        0, features, torch.ones(6), sample_count=6, step=1
+    )
+    state = protector.states[0]
+    normalized = direction / direction.norm()
+    assert state.effective_rank >= 1
+    assert torch.abs(torch.dot(state.basis[:, 0], normalized)) > 0.999
+
+
+def test_equal_orthogonal_directions_retain_two_dimensional_energy() -> None:
+    protector = _protector(rank=0, energy_threshold=0.99)
+    features = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    ).repeat(4, 1)
+
+    assert protector.refresh_expert(
+        0, features, torch.ones(8), sample_count=8, step=2
+    )
+    state = protector.states[0]
+    assert state.effective_rank == 2
+    assert torch.allclose(state.basis.T @ state.basis, torch.eye(2), atol=1e-6)
+    assert abs(state.captured_energy - 1.0) < 1e-6
+
+
+def test_weighted_second_moment_prioritizes_high_evidence_direction() -> None:
+    protector = _protector(rank=1)
+    features = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
+    )
+    weights = torch.tensor([9.0, 1.0])
+
+    assert protector.refresh_expert(
+        0, features, weights, sample_count=2, step=3
+    )
+    first = protector.states[0].basis[:, 0]
+    assert torch.abs(first[0]) > 0.999
+    assert torch.abs(first[1]) < 1e-6

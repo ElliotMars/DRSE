@@ -321,20 +321,23 @@ python -u main.py \
 | `--disable_expert_online_update` | false | 冻结在线 Expert，仅更新 Neural Router |
 | `--disable_tsb` | false | 完整关闭 TSB |
 | `--online_log_interval` | 500 | 在线诊断日志间隔 |
+| `--credit_diagnostic_buffer_size` | 10000 | 内存中保留的 record 级 credit 诊断上限 |
 
 `--disable_tsb` 会关闭参考梯度、梯度平滑、冲突投影、TSB buffer 和与 TSB 绑定的自适应在线步长，而不只是将 `tsb_alpha` 设为 0。
+
+Router 始终先产生所有 Expert 均为正且归一化的 dense prior。Progressive 模式先计算 `softmax(log(prior) + z)`，再对修正后的结果执行 top-k 并重新归一化；因此快速 correction 可以把原本不在 prior top-k 内的 Expert 提升为有效路由。局部责任学习监督 dense prior，mixture prediction 使用稀疏 effective weights。Router 熵奖励在 partial 与完整反馈更新中均为 `loss - router_entropy_weight × entropy`；权重为 0 时不额外构建熵的反向图。
 
 ### Stable/Recovery memory 生命周期
 
 完整 record 使用预测时 Expert 输出计算 sample responsibility，并用预测时/当前 capability sketch 的 cosine alignment 做 version-aware credit transport。高责任且高 alignment 的样本进入 Stable；高责任但低 alignment 的样本进入 Recovery。两类 buffer 都是固定容量：Stable 会执行 sketch 重复检测并按 `responsibility × alignment` 替换，Recovery 按带失败次数惩罚的 recovery score 替换。
 
-周期重评时，alignment 下降的 Stable 样本迁往 Recovery。每次完整 Expert 更新会从各 Recovery buffer 无重复采样；历史 prediction-time sketch 强制 stop-gradient，当前 Expert 分支保留梯度。更新后重新计算 loss/alignment，满足阈值则升回 Stable，超过最大 replay attempts 且未恢复则淘汰。所有 replay、memory 和 subspace 额外 forward 都禁用 FSNet 持久状态写入。
+周期重评时，alignment 下降的 Stable 样本会先从 Stable 删除，再尝试迁往 Recovery；若 Recovery 已满且拒绝该样本，样本直接淘汰，不会错误地留在 Stable。每次完整 Expert 更新会使用同一个排除集合从所有 Recovery buffer 无重复采样，因此相同 sample ID 在一个 online step 最多 replay 一次；历史 prediction-time sketch 强制 stop-gradient，当前 Expert 分支保留梯度。更新后重新计算 loss/alignment，满足阈值则升回 Stable，超过最大 replay attempts 且未恢复则淘汰。所有 replay、memory 和 subspace 额外 forward 都禁用 FSNet 持久状态写入。
 
 ### Expert update strategies
 
 `plain` 使用原始梯度；`tsb` 保留原有参考梯度平滑和冲突投影；`subspace` 不计算 TSB reference，只过滤 prediction-head weight；`hybrid` 先执行 TSB，再执行 prediction-head subspace filtering。`--disable_tsb` 保留兼容：与 `tsb` 冲突时降为 `plain`，与 `hybrid` 冲突时降为 `subspace`，启动时会打印 warning。
 
-Subspace 使用 Stable head features 构建加权 `[320,320]` covariance 并调用 `torch.linalg.eigh`，不会构建 `[B*C,B*C]` 矩阵。FSNet-Time 的 channel feature 都作为观测，但同一样本的权重平均分配给所有 channel。其主要额外开销是周期性 read-only feature forward、每个 Expert 一个 320 维特征协方差和至多 `subspace_max_rank` 个 basis 向量；当前不保护 encoder 层。
+Subspace 使用 Stable head features 构建非中心化加权二阶矩 `M = Hᵀ diag(w) H / sum(w)`，对称化后调用 `torch.linalg.eigh`。不做均值中心化，因此重复出现的同一 prediction-head activation 方向仍会被保护。实现只构建 `[320,320]` 矩阵，不会构建 `[B*C,B*C]` 矩阵；负权重会显式报错，非有限或证据不足的刷新会保留旧 basis。FSNet-Time 的 channel feature 都作为观测，但同一样本的权重平均分配给所有 channel。其主要额外开销是周期性 read-only feature forward、每个 Expert 一个 320 维特征协方差和至多 `subspace_max_rank` 个 basis 向量；当前不保护 encoder 层。
 
 ECL 在 `seq_len=60`、`pred_len=48`、321 通道、sketch 维数 32 时，每个 memory item 约保存 35,152 个浮点值：FP16 约 68.7 KiB。默认每个 Expert 32 个 Stable 加 32 个 Recovery、4 个 Expert 全部满载的上界约为 17.2 MiB；FP32 约为 34.3 MiB。Python 对象和少量标量开销未计入，`credit_top_k=1` 会限制单个 record 的复制数量。
 
@@ -361,7 +364,10 @@ result/resultsN/<setting>/
 ├── mae.npy
 ├── mse.npy
 ├── preds.npy
-└── trues.npy
+├── trues.npy
+├── online_diagnostics.npz
+├── credit_diagnostics.npz
+└── online_diagnostics_summary.json
 ```
 
 `metrics.npy` 依次包含 MAE、MSE、RMSE、MAPE、MSPE 和运行时间；`mae.npy`、`mse.npy` 保存在线累计曲线。
@@ -372,7 +378,7 @@ result/resultsN/<setting>/
 [DELAY_FB] rolling origins; feedback delay=24 steps
 ```
 
-Progressive Multi-Expert 诊断按 `online_log_interval` 聚合，包含 MSE、prior/effective entropy、`z` norm、Expert 权重与独立 MSE、责任与版本漂移、buffer 生命周期、Recovery 成功率、subspace rank/energy/drift、平行/正交梯度、gamma、TSB conflict rate 和 Router Gap。控制台只保留稀疏摘要，完整数组和 summary 写入当前 setting 目录。
+Progressive Multi-Expert 诊断按 `online_log_interval` 聚合，包含 MSE、prior/effective entropy、`z` norm、Expert 权重与独立 MSE、责任与版本漂移、buffer 生命周期、Recovery 成功率、subspace rank/energy/drift、平行/正交梯度、gamma、TSB conflict rate 和 Router Gap。控制台只保留稀疏摘要。区间数组写入 `online_diagnostics.npz`；bounded record 级 JS divergence、ranking reversal、alignment、confidence 和 Expert update count 写入 `credit_diagnostics.npz`；summary 同时报告累计 record 数、实际保留数与估算覆盖数。
 
 ## 目录结构
 

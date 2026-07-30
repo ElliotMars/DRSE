@@ -63,3 +63,35 @@ def test_decay_happens_only_once_per_origin() -> None:
     assert torch.allclose(after_first, torch.tensor([[[1.5, -1.5]], [[0.75, -0.75]]]))
     assert torch.allclose(correction.z, after_first * 0.75)
 
+
+
+def test_correction_precedes_top_k_and_can_change_selected_expert() -> None:
+    correction = OnlineRoutingCorrection(
+        pred_len=1, c_out=1, num_experts=3, device=torch.device("cpu"),
+        correction_lr=0.1, correction_decay=0.0,
+        correction_grad_clip=10.0, correction_logit_clip=10.0,
+    )
+    prior = torch.tensor([[[0.80, 0.15, 0.05]]])
+    correction.z.copy_(torch.tensor([[[0.0, 0.0, 5.0]]]))
+
+    effective = correction.effective_weights(prior, top_k=1)
+
+    assert effective.argmax(dim=-1).item() == 2
+    assert torch.equal((effective > 0).sum(dim=-1), torch.ones(1, 1, dtype=torch.long))
+    assert torch.allclose(effective.sum(dim=-1), torch.ones(1, 1))
+
+
+def test_zero_correction_top_k_matches_prior_ranking() -> None:
+    correction = OnlineRoutingCorrection(
+        pred_len=1, c_out=1, num_experts=3, device=torch.device("cpu"),
+        correction_lr=0.1, correction_decay=0.0,
+        correction_grad_clip=10.0, correction_logit_clip=10.0,
+    )
+    prior = torch.tensor([[[0.80, 0.15, 0.05]]])
+
+    effective = correction.effective_weights(prior, top_k=2)
+
+    assert torch.equal(effective > 0, torch.tensor([[[True, True, False]]]))
+    assert torch.allclose(effective.sum(dim=-1), torch.ones(1, 1))
+    assert bool((effective >= 0).all())
+    assert bool(torch.isfinite(effective).all())
