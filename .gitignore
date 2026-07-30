@@ -23,3 +23,4 @@ scripts/run_multi_expert_pretrain_only.sh
 scripts/run_onenet.sh
 scripts/run_patchtst_dgrad.sh
 scripts/run_proceed.sh
+prompt.md

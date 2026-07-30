@@ -7,3 +7,4 @@ scikit-learn==1.7.2
 numexpr==2.14.1
 tqdm==4.68.4
 einops==0.8.2
+pytest>=8,<10
