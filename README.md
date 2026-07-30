@@ -12,9 +12,11 @@
 
 - 2 个 FSNet 专家，建模跨变量表示；
 - 2 个 FSNet-Time 专家，建模每个变量的时间模式；
-- 通道级路由器，为每个变量动态生成专家权重；
-- 可选 top-k 路由；
-- TSB 在线更新机制，通过历史已释放样本的参考梯度进行平滑和冲突投影；
+- channel 或 factorized horizon-channel Router；
+- 可选 top-k 路由与逐 horizon/channel 的快速 correction `z`；
+- version-aware Stable/Recovery memory 与 Recovery replay；
+- 责任条件化 prediction-head capability subspace；
+- `plain`、`tsb`、`subspace`、`hybrid` 四种 Expert 更新策略；
 - 专家与路由器独立的离线、在线学习率和梯度裁剪。
 
 主要实现位于：
@@ -27,28 +29,26 @@ models/ts2vec/fsnet_.py
 
 ## 滚动延迟反馈
 
-启用 `--delay_fb` 后，预测起点仍然每次前进一个时间点。设预测长度为 `H=pred_len`，在线时序为：
+预测起点始终每次前进一个时间点。只启用 `--delay_fb` 时保留旧的完整窗口延迟协议。额外启用 `--progressive_fb` 后，origin `s` 会在预测之前释放当前输入最后一个观测点，并将其分配给所有满足 `h=s-o` 的历史预测：
 
 ```text
-predict origin 0
-predict origin 1
-...
-predict origin H-1
-release/update origin 0
-predict origin H
-release/update origin 1
-predict origin H+1
-...
+origin 0: predict origin 0
+origin 1: release origin 0 / h=1, then predict origin 1
+origin 2: release origin 0 / h=2 and origin 1 / h=1, then predict origin 2
 ```
 
 这意味着：
 
-- 当前预测窗口的完整未来标签不会立即参与更新；
-- origin `t` 的标签只会在 origin `t+H` 到达后释放；
+- record 不保存尚未成熟的完整未来标签；
+- 每个成熟位置立即更新快速 Router correction `z` 和 Neural Router 的局部 credit；
+- Expert 仍只在 record 的全部 `H` 个 target 成熟后更新；
+- 测试结束不人为 flush 尚未成熟的 record；
 - 延迟模式不会再通过 `index * pred_len` 跳过中间窗口；
-- 延迟和非延迟模式评估相同的预测起点，但可用于模型更新的信息不同。
+- 所有 capability 对比和 memory 重评 forward 都禁止更新 FSNet 持久状态。
 
-在线测试建议固定 `--test_bsz 1`。
+在线测试建议固定 `--test_bsz 1`。完整 progressive origin 顺序为：先衰减 `z`，释放成熟位置，更新 `z` 和 Neural Router；完整 record 成熟后计算责任与版本对齐，用旧 subspace 完成 supervised + Recovery Expert 更新，再将该 record 写入 memory；随后周期刷新 memory/subspace，最后预测当前 origin。当前预测窗口的未来真值仅用于离线指标，不进入任何更新或 record。
+
+Subspace 第一版的保护范围严格限制为 prediction head：`ExpertNet.regressor` 与 `FSNetTimeExpertNet.regressor_time` 的 weight；bias 和 encoder 参数不投影。对应配置固定为 `--subspace_scope regressor`。
 
 ## 已实现方法
 
@@ -212,6 +212,37 @@ python -u main.py \
 
 `--method` 应显式指定为上表中的实现之一。
 
+## 运行 Progressive Credit + Subspace
+
+第三阶段使用独立入口，不覆盖原有脚本：
+
+```bash
+bash scripts/run_progressive_credit_subspace.sh
+```
+
+默认启用 progressive feedback、`horizon_channel` Router、在线 correction、capability sketch、Stable/Recovery memory，并显式选择 `subspace` Expert 更新策略。支持 `DATASETS`、`LENS`、`GPU_IDS`、`MAX_PER_GPU`、`PRETRAIN_MODE`、`ROUTER_GRANULARITY`、`CORRECTION_LR`、`LOCAL_CREDIT_WEIGHT`、`STABLE_BUFFER_SIZE`、`RECOVERY_BUFFER_SIZE`、`SUBSPACE_RANK`、`SUBSPACE_LAMBDA` 和 `EXPERT_UPDATE_STRATEGY` 等环境变量。例如：
+
+```bash
+DATASETS="WTH ECL" LENS="24 48" GPU_IDS=0,1 MAX_PER_GPU=1 \
+EXPERT_UPDATE_STRATEGY=hybrid bash scripts/run_progressive_credit_subspace.sh
+```
+
+消融实验通过参数组合完成，无需复制实现：
+
+| 消融 | 关键参数（其余沿用新脚本默认值） |
+|---|---|
+| Neural Router only | `--disable_expert_online_update --disable_online_correction --stable_buffer_size 0 --recovery_buffer_size 0 --expert_update_strategy plain` |
+| Neural Router + progressive z | 上述配置移除 `--disable_online_correction` |
+| Progressive correction，无 version awareness | `--disable_version_awareness` |
+| Single Stable，无 Recovery | `--disable_recovery` |
+| Stable + Recovery，无 subspace | `--expert_update_strategy plain` |
+| 普通 per-Expert subspace | `--disable_credit_weighted_subspace --expert_update_strategy subspace` |
+| Responsibility-conditioned subspace | `--disable_version_awareness --expert_update_strategy subspace` |
+| Version-aware responsibility-conditioned subspace | `--expert_update_strategy subspace` |
+| TSB | `--expert_update_strategy tsb` |
+| Subspace | `--expert_update_strategy subspace` |
+| Hybrid | `--expert_update_strategy hybrid` |
+
 ## 预训练与 checkpoint
 
 默认 `--pretrain_mode retrain` 会先训练模型，再执行在线测试。加载已有权重时使用：
@@ -248,10 +279,64 @@ python -u main.py \
 | `--router_grad_clip` | 0.5 | 路由器梯度裁剪阈值 |
 | `--router_temperature` | 2.0 | 路由 softmax 温度 |
 | `--router_entropy_weight` | 0.001 | 路由熵正则权重 |
+| `--progressive_fb` | false | 启用逐时间点成熟反馈 |
+| `--router_granularity` | channel | `channel` 或 factorized `horizon_channel` |
+| `--correction_lr` | 0.1 | 快速 Router dual correction 学习率 |
+| `--correction_decay` | 0.01 | 每个 origin 执行一次的 correction 衰减 |
+| `--local_credit_temperature` | 1.0 | `(h,c)` 局部责任温度 |
+| `--sample_credit_temperature` | 1.0 | record 级 Expert 责任温度 |
+| `--local_credit_weight` | 0.1 | partial Router local-credit loss 权重 |
+| `--min_credit_eps` | 1e-8 | credit、熵和对数计算下界 |
+| `--capability_sketch_dim` | 32 | 每个 Expert 的能力 sketch 维数 |
+| `--capability_sketch_seed` | 2025 | 固定随机投影 seed |
+| `--responsibility_threshold` | 0.3 | Expert memory 最低 sample responsibility |
+| `--alignment_threshold` | 0.8 | Stable/Recovery 准入分界 |
+| `--credit_top_k` | 1 | 每个完整 record 最多归属的 Expert 数 |
+| `--stable_buffer_size` | 32 | 每个 Expert 的 Stable 容量 |
+| `--recovery_buffer_size` | 32 | 每个 Expert 的 Recovery 容量 |
+| `--buffer_duplicate_threshold` | 0.98 | Stable sketch 重复判定阈值 |
+| `--recovery_failure_penalty` | 0.5 | Recovery 尝试次数惩罚 |
+| `--max_recovery_attempts` | 3 | Recovery 淘汰前最大失败次数 |
+| `--buffer_storage_dtype` | fp16 | CPU memory tensor 的 `fp16` 或 `fp32` 存储 |
+| `--memory_refresh_interval` | 100 | 完整 record 数量上的 memory 重评周期 |
+| `--promote_alignment_threshold` | 0.9 | Recovery 升回 Stable 的 alignment 阈值 |
+| `--promote_loss_threshold` | 1.0 | Recovery 升回 Stable 的当前损失阈值 |
+| `--recovery_batch_size` | 2 | 每个 Expert 每次更新采样的 Recovery 数量 |
+| `--recovery_loss_weight` | 0.1 | Recovery replay 总损失权重 |
+| `--recovery_sketch_weight` | 1.0 | replay 内 sketch distillation 权重 |
+| `--subspace_scope` | regressor | 当前唯一支持的保护范围 |
+| `--subspace_rank` | 0 | 固定 rank；0 表示按累计能量选择 |
+| `--subspace_max_rank` | 32 | subspace 最大 rank |
+| `--subspace_energy_threshold` | 0.95 | 自动 rank 的累计能量阈值 |
+| `--subspace_refresh_interval` | 100 | subspace 刷新周期 |
+| `--subspace_min_samples` | 4 | 刷新所需最少 Stable 样本数 |
+| `--subspace_eps` | 1e-8 | covariance、rank 与投影数值下界 |
+| `--subspace_lambda` | 1e4 | 稳定证据保护强度 |
+| `--subspace_gamma_min/max` | 0.0 / 1.0 | 软投影 gamma 裁剪范围 |
+| `--expert_update_strategy` | tsb | `plain`、`tsb`、`subspace` 或 `hybrid` |
+| `--disable_online_correction` | false | progressive 协议保留但禁用 `z` |
+| `--disable_version_awareness` | false | alignment 在 credit/memory 中视为 1 |
+| `--disable_recovery` | false | 只使用 Stable buffer，不做 replay |
+| `--disable_credit_weighted_subspace` | false | subspace 样本等权 |
+| `--disable_expert_online_update` | false | 冻结在线 Expert，仅更新 Neural Router |
 | `--disable_tsb` | false | 完整关闭 TSB |
 | `--online_log_interval` | 500 | 在线诊断日志间隔 |
 
 `--disable_tsb` 会关闭参考梯度、梯度平滑、冲突投影、TSB buffer 和与 TSB 绑定的自适应在线步长，而不只是将 `tsb_alpha` 设为 0。
+
+### Stable/Recovery memory 生命周期
+
+完整 record 使用预测时 Expert 输出计算 sample responsibility，并用预测时/当前 capability sketch 的 cosine alignment 做 version-aware credit transport。高责任且高 alignment 的样本进入 Stable；高责任但低 alignment 的样本进入 Recovery。两类 buffer 都是固定容量：Stable 会执行 sketch 重复检测并按 `responsibility × alignment` 替换，Recovery 按带失败次数惩罚的 recovery score 替换。
+
+周期重评时，alignment 下降的 Stable 样本迁往 Recovery。每次完整 Expert 更新会从各 Recovery buffer 无重复采样；历史 prediction-time sketch 强制 stop-gradient，当前 Expert 分支保留梯度。更新后重新计算 loss/alignment，满足阈值则升回 Stable，超过最大 replay attempts 且未恢复则淘汰。所有 replay、memory 和 subspace 额外 forward 都禁用 FSNet 持久状态写入。
+
+### Expert update strategies
+
+`plain` 使用原始梯度；`tsb` 保留原有参考梯度平滑和冲突投影；`subspace` 不计算 TSB reference，只过滤 prediction-head weight；`hybrid` 先执行 TSB，再执行 prediction-head subspace filtering。`--disable_tsb` 保留兼容：与 `tsb` 冲突时降为 `plain`，与 `hybrid` 冲突时降为 `subspace`，启动时会打印 warning。
+
+Subspace 使用 Stable head features 构建加权 `[320,320]` covariance 并调用 `torch.linalg.eigh`，不会构建 `[B*C,B*C]` 矩阵。FSNet-Time 的 channel feature 都作为观测，但同一样本的权重平均分配给所有 channel。其主要额外开销是周期性 read-only feature forward、每个 Expert 一个 320 维特征协方差和至多 `subspace_max_rank` 个 basis 向量；当前不保护 encoder 层。
+
+ECL 在 `seq_len=60`、`pred_len=48`、321 通道、sketch 维数 32 时，每个 memory item 约保存 35,152 个浮点值：FP16 约 68.7 KiB。默认每个 Expert 32 个 Stable 加 32 个 Recovery、4 个 Expert 全部满载的上界约为 17.2 MiB；FP32 约为 34.3 MiB。Python 对象和少量标量开销未计入，`credit_top_k=1` 会限制单个 record 的复制数量。
 
 查看全部参数：
 
@@ -287,7 +372,7 @@ result/resultsN/<setting>/
 [DELAY_FB] rolling origins; feedback delay=24 steps
 ```
 
-Multi-Expert 在线诊断还包含 routed/uniform/expert MSE、最差通道、路由熵、动态学习率和梯度范数。
+Progressive Multi-Expert 诊断按 `online_log_interval` 聚合，包含 MSE、prior/effective entropy、`z` norm、Expert 权重与独立 MSE、责任与版本漂移、buffer 生命周期、Recovery 成功率、subspace rank/energy/drift、平行/正交梯度、gamma、TSB conflict rate 和 Router Gap。控制台只保留稀疏摘要，完整数组和 summary 写入当前 setting 目录。
 
 ## 目录结构
 
@@ -313,8 +398,17 @@ Multi-Expert 在线诊断还包含 routed/uniform/expert MSE、最差通道、�
 │   ├── dsof.py
 │   └── proceed.py
 ├── scripts/
-│   └── run_multi_expert.sh
+│   ├── run_multi_expert.sh
+│   └── run_progressive_credit_subspace.sh
+├── tests/
+│   ├── test_progressive_online_order.py
+│   ├── test_recovery_learning.py
+│   └── test_subspace_protection.py
 ├── utils/
+│   ├── expert_memory.py
+│   ├── online_diagnostics.py
+│   ├── recovery_learning.py
+│   ├── subspace_protection.py
 │   ├── metrics.py
 │   ├── timefeatures.py
 │   └── tools.py

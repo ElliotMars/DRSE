@@ -54,6 +54,30 @@ router_grad_clip="${ROUTER_GRAD_CLIP:-0.5}"
 router_temperature="${ROUTER_TEMPERATURE:-2.0}"
 router_entropy_weight="${ROUTER_ENTROPY_WEIGHT:-0.001}"
 online_log_interval="${ONLINE_LOG_INTERVAL:-500}"
+progressive_fb="${PROGRESSIVE_FB:-0}"
+router_granularity="${ROUTER_GRANULARITY:-channel}"
+correction_lr="${CORRECTION_LR:-0.1}"
+correction_decay="${CORRECTION_DECAY:-0.01}"
+correction_grad_clip="${CORRECTION_GRAD_CLIP:-10.0}"
+correction_logit_clip="${CORRECTION_LOGIT_CLIP:-5.0}"
+local_credit_temperature="${LOCAL_CREDIT_TEMPERATURE:-1.0}"
+sample_credit_temperature="${SAMPLE_CREDIT_TEMPERATURE:-1.0}"
+local_credit_weight="${LOCAL_CREDIT_WEIGHT:-0.1}"
+min_credit_eps="${MIN_CREDIT_EPS:-1e-8}"
+capability_sketch_dim="${CAPABILITY_SKETCH_DIM:-32}"
+capability_sketch_seed="${CAPABILITY_SKETCH_SEED:-2025}"
+responsibility_threshold="${RESPONSIBILITY_THRESHOLD:-0.3}"
+alignment_threshold="${ALIGNMENT_THRESHOLD:-0.8}"
+credit_top_k="${CREDIT_TOP_K:-1}"
+stable_buffer_size="${STABLE_BUFFER_SIZE:-32}"
+recovery_buffer_size="${RECOVERY_BUFFER_SIZE:-32}"
+buffer_duplicate_threshold="${BUFFER_DUPLICATE_THRESHOLD:-0.98}"
+recovery_failure_penalty="${RECOVERY_FAILURE_PENALTY:-0.5}"
+max_recovery_attempts="${MAX_RECOVERY_ATTEMPTS:-3}"
+buffer_storage_dtype="${BUFFER_STORAGE_DTYPE:-fp16}"
+memory_refresh_interval="${MEMORY_REFRESH_INTERVAL:-100}"
+promote_alignment_threshold="${PROMOTE_ALIGNMENT_THRESHOLD:-0.9}"
+promote_loss_threshold="${PROMOTE_LOSS_THRESHOLD:-1.0}"
 
 learning_rate_expert=1e-3
 learning_rate_router=1e-3
@@ -187,6 +211,9 @@ gpu="$PICKED_GPU"
 log_file="$LOG_DIR/multi_expert_${online_variant}_${data}_${len}_${online_learning}.out"
 
 extra_args=(--pretrain_mode "$PRETRAIN_MODE" --checkpoint_tag "$checkpoint_tag")
+if [[ "$progressive_fb" == "1" || "$progressive_fb" == "true" ]]; then
+    extra_args+=(--progressive_fb)
+fi
 if [[ "$PRETRAIN_MODE" == "load" ]]; then
     latest_ckpt=$(find_latest_checkpoint "${m}_${pretrained_checkpoint_tag}" "$data" "$len" "$online_learning" "$opt_name" "$bsz")
     if [[ -z "$latest_ckpt" ]]; then
@@ -230,6 +257,29 @@ submit_job "$gpu" "$log_file" \
     --router_grad_clip "$router_grad_clip" \
     --router_temperature "$router_temperature" \
     --router_entropy_weight "$router_entropy_weight" \
+    --router_granularity "$router_granularity" \
+    --correction_lr "$correction_lr" \
+    --correction_decay "$correction_decay" \
+    --correction_grad_clip "$correction_grad_clip" \
+    --correction_logit_clip "$correction_logit_clip" \
+    --local_credit_temperature "$local_credit_temperature" \
+    --sample_credit_temperature "$sample_credit_temperature" \
+    --local_credit_weight "$local_credit_weight" \
+    --min_credit_eps "$min_credit_eps" \
+    --capability_sketch_dim "$capability_sketch_dim" \
+    --capability_sketch_seed "$capability_sketch_seed" \
+    --responsibility_threshold "$responsibility_threshold" \
+    --alignment_threshold "$alignment_threshold" \
+    --credit_top_k "$credit_top_k" \
+    --stable_buffer_size "$stable_buffer_size" \
+    --recovery_buffer_size "$recovery_buffer_size" \
+    --buffer_duplicate_threshold "$buffer_duplicate_threshold" \
+    --recovery_failure_penalty "$recovery_failure_penalty" \
+    --max_recovery_attempts "$max_recovery_attempts" \
+    --buffer_storage_dtype "$buffer_storage_dtype" \
+    --memory_refresh_interval "$memory_refresh_interval" \
+    --promote_alignment_threshold "$promote_alignment_threshold" \
+    --promote_loss_threshold "$promote_loss_threshold" \
     --online_log_interval "$online_log_interval" \
     "${extra_args[@]}"
 done

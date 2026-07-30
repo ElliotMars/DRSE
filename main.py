@@ -177,6 +177,65 @@ def parse_args():
     parser.add_argument('--router_grad_clip', type=float, default=0.5)
     parser.add_argument('--router_temperature', type=float, default=2.0)
     parser.add_argument('--router_entropy_weight', type=float, default=1e-3)
+    parser.add_argument('--progressive_fb', action='store_true', default=False,
+                        help='release one newly matured timestamp per rolling origin')
+    parser.add_argument('--router_granularity', type=str, default='channel',
+                        choices=['channel', 'horizon_channel'],
+                        help='router weight granularity; channel preserves legacy checkpoints')
+    parser.add_argument('--correction_lr', type=float, default=0.1,
+                        help='learning rate for progressive dual routing correction')
+    parser.add_argument('--correction_decay', type=float, default=0.01,
+                        help='per-origin decay applied once to routing correction')
+    parser.add_argument('--correction_grad_clip', type=float, default=10.0,
+                        help='elementwise clip for centered mixture gradients')
+    parser.add_argument('--correction_logit_clip', type=float, default=5.0,
+                        help='absolute clip for online routing correction logits')
+    parser.add_argument('--local_credit_temperature', type=float, default=1.0)
+    parser.add_argument('--sample_credit_temperature', type=float, default=1.0)
+    parser.add_argument('--local_credit_weight', type=float, default=0.1)
+    parser.add_argument('--min_credit_eps', type=float, default=1e-8)
+    parser.add_argument('--capability_sketch_dim', type=int, default=32)
+    parser.add_argument('--capability_sketch_seed', type=int, default=2025)
+    parser.add_argument('--responsibility_threshold', type=float, default=0.3)
+    parser.add_argument('--alignment_threshold', type=float, default=0.8)
+    parser.add_argument('--credit_top_k', type=int, default=1)
+    parser.add_argument('--stable_buffer_size', type=int, default=32)
+    parser.add_argument('--recovery_buffer_size', type=int, default=32)
+    parser.add_argument('--buffer_duplicate_threshold', type=float, default=0.98)
+    parser.add_argument('--recovery_failure_penalty', type=float, default=0.5)
+    parser.add_argument('--max_recovery_attempts', type=int, default=3)
+    parser.add_argument('--buffer_storage_dtype', type=str, default='fp16',
+                        choices=['fp16', 'fp32'])
+    parser.add_argument('--memory_refresh_interval', type=int, default=100)
+    parser.add_argument('--promote_alignment_threshold', type=float, default=0.9)
+    parser.add_argument('--promote_loss_threshold', type=float, default=1.0)
+    parser.add_argument('--recovery_batch_size', type=int, default=2)
+    parser.add_argument('--recovery_loss_weight', type=float, default=0.1)
+    parser.add_argument('--recovery_sketch_weight', type=float, default=1.0)
+    parser.add_argument('--subspace_scope', type=str, default='regressor',
+                        choices=['regressor'])
+    parser.add_argument('--subspace_rank', type=int, default=0,
+                        help='fixed rank; 0 selects rank by energy')
+    parser.add_argument('--subspace_max_rank', type=int, default=32)
+    parser.add_argument('--subspace_energy_threshold', type=float, default=0.95)
+    parser.add_argument('--subspace_refresh_interval', type=int, default=100)
+    parser.add_argument('--subspace_min_samples', type=int, default=4)
+    parser.add_argument('--subspace_eps', type=float, default=1e-8)
+    parser.add_argument('--subspace_lambda', type=float, default=1e4)
+    parser.add_argument('--subspace_gamma_min', type=float, default=0.0)
+    parser.add_argument('--subspace_gamma_max', type=float, default=1.0)
+    parser.add_argument('--expert_update_strategy', type=str, default='tsb',
+                        choices=['plain', 'tsb', 'subspace', 'hybrid'])
+    parser.add_argument('--disable_version_awareness', action='store_true',
+                        default=False)
+    parser.add_argument('--disable_recovery', action='store_true', default=False)
+    parser.add_argument('--disable_credit_weighted_subspace', action='store_true',
+                        default=False)
+    parser.add_argument('--disable_online_correction', action='store_true',
+                        default=False)
+    parser.add_argument('--disable_expert_online_update', action='store_true',
+                        default=False,
+                        help='freeze Experts online while retaining Router updates')
     parser.add_argument('--robust_fallback_threshold', type=float, default=0.0,
                         help='deprecated compatibility option; v3 only replaces non-finite predictions')
     parser.add_argument('--online_log_interval', type=int, default=500)
@@ -373,3 +432,6 @@ if __name__ == '__main__':
     np.save(folder_path + 'trues.npy', np.array(true))
     np.save(folder_path + 'mae.npy', np.array(mae))
     np.save(folder_path + 'mse.npy', np.array(mse))
+    if hasattr(exp, 'save_online_diagnostics') and args.progressive_fb:
+        npz_path, json_path = exp.save_online_diagnostics(folder_path)
+        print('online diagnostics:', npz_path, json_path)
