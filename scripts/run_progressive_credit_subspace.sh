@@ -69,6 +69,8 @@ SUBSPACE_GAMMA_MIN="${SUBSPACE_GAMMA_MIN:-0.0}"
 SUBSPACE_GAMMA_MAX="${SUBSPACE_GAMMA_MAX:-1.0}"
 MEMORY_REFRESH_INTERVAL="${MEMORY_REFRESH_INTERVAL:-100}"
 ONLINE_LOG_INTERVAL="${ONLINE_LOG_INTERVAL:-500}"
+MAX_ONLINE_STEPS="${MAX_ONLINE_STEPS:--1}"
+STRICT_ONLINE_CHECKS="${STRICT_ONLINE_CHECKS:-0}"
 
 declare -a RUN_PIDS=()
 declare -A PID_GPU=()
@@ -124,6 +126,8 @@ append_disable_flags() {
         EXTRA_FLAGS+=(--disable_tsb)
     [[ "${DISABLE_EXPERT_ONLINE_UPDATE:-0}" == "1" ]] &&
         EXTRA_FLAGS+=(--disable_expert_online_update)
+    [[ "$STRICT_ONLINE_CHECKS" == "1" ]] &&
+        EXTRA_FLAGS+=(--strict_online_checks)
 }
 
 find_latest_checkpoint() {
@@ -216,6 +220,7 @@ for data in "${datasets[@]}"; do
         --num_experts "$NUM_EXPERTS" \
         --top_k "$TOP_K" \
         --online_log_interval "$ONLINE_LOG_INTERVAL" \
+        --max_online_steps "$MAX_ONLINE_STEPS" \
         "${EXTRA_FLAGS[@]}" \
         "${pretrain_args[@]}" > "$log" 2>&1 &
     pid=$!

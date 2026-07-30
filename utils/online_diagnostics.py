@@ -27,6 +27,11 @@ class OnlineDiagnosticsRecorder:
             "drop_count": 0.0,
             "recovery_attempts": 0.0,
             "recovery_successes": 0.0,
+            "recovery_to_stable": 0.0,
+            "recovery_dropped_after_success": 0.0,
+            "recovery_failed": 0.0,
+            "recovery_evicted": 0.0,
+            "recovery_attempt_exhausted": 0.0,
         }
         self.records: list[dict[str, Any]] = []
         self._last_recorded_step: int | None = None

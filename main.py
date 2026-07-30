@@ -240,6 +240,10 @@ def parse_args():
                         help='deprecated compatibility option; v3 only replaces non-finite predictions')
     parser.add_argument('--online_log_interval', type=int, default=500)
     parser.add_argument('--credit_diagnostic_buffer_size', type=int, default=10000)
+    parser.add_argument('--max_online_steps', type=int, default=-1,
+                        help='limit test origins for smoke tests; -1 is unlimited')
+    parser.add_argument('--strict_online_checks', action='store_true', default=False,
+                        help='enable expensive progressive runtime invariant checks')
     # DynaME baseline
     parser.add_argument('--dyname_period_num', type=int, default=2)
     parser.add_argument('--dyname_krr_lambda', type=float, default=1e-4)

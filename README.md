@@ -227,6 +227,16 @@ DATASETS="WTH ECL" LENS="24 48" GPU_IDS=0,1 MAX_PER_GPU=1 \
 EXPERT_UPDATE_STRATEGY=hybrid bash scripts/run_progressive_credit_subspace.sh
 ```
 
+真实数据短程 smoke test 可以复用同一脚本，不改变完整实验默认行为：
+
+```bash
+DATASETS=ETTh2 LENS=24 PRETRAIN_MODE=load MAX_ONLINE_STEPS=200 \
+STRICT_ONLINE_CHECKS=1 ONLINE_LOG_INTERVAL=50 \
+bash scripts/run_progressive_credit_subspace.sh
+```
+
+`MAX_ONLINE_STEPS=-1` 表示不限制；严格检查只建议在短程 smoke test 中开启。
+
 消融实验通过参数组合完成，无需复制实现：
 
 | 消融 | 关键参数（其余沿用新脚本默认值） |
@@ -322,6 +332,8 @@ python -u main.py \
 | `--disable_tsb` | false | 完整关闭 TSB |
 | `--online_log_interval` | 500 | 在线诊断日志间隔 |
 | `--credit_diagnostic_buffer_size` | 10000 | 内存中保留的 record 级 credit 诊断上限 |
+| `--max_online_steps` | -1 | smoke test 最大 online origin 数；-1 不限制 |
+| `--strict_online_checks` | false | 开启高开销在线有限性、归一化、生命周期和顺序检查 |
 
 `--disable_tsb` 会关闭参考梯度、梯度平滑、冲突投影、TSB buffer 和与 TSB 绑定的自适应在线步长，而不只是将 `tsb_alpha` 设为 0。
 
@@ -331,7 +343,11 @@ Router 始终先产生所有 Expert 均为正且归一化的 dense prior。Progr
 
 完整 record 使用预测时 Expert 输出计算 sample responsibility，并用预测时/当前 capability sketch 的 cosine alignment 做 version-aware credit transport。高责任且高 alignment 的样本进入 Stable；高责任但低 alignment 的样本进入 Recovery。两类 buffer 都是固定容量：Stable 会执行 sketch 重复检测并按 `responsibility × alignment` 替换，Recovery 按带失败次数惩罚的 recovery score 替换。
 
-周期重评时，alignment 下降的 Stable 样本会先从 Stable 删除，再尝试迁往 Recovery；若 Recovery 已满且拒绝该样本，样本直接淘汰，不会错误地留在 Stable。每次完整 Expert 更新会使用同一个排除集合从所有 Recovery buffer 无重复采样，因此相同 sample ID 在一个 online step 最多 replay 一次；历史 prediction-time sketch 强制 stop-gradient，当前 Expert 分支保留梯度。更新后重新计算 loss/alignment，满足阈值则升回 Stable，超过最大 replay attempts 且未恢复则淘汰。所有 replay、memory 和 subspace 额外 forward 都禁用 FSNet 持久状态写入。
+周期重评时，alignment 下降的 Stable 样本会先从 Stable 删除，再尝试迁往 Recovery；若 Recovery 已满且拒绝该样本，样本直接淘汰，不会错误地留在 Stable。每次完整 Expert 更新会使用同一个排除集合从所有 Recovery buffer 无重复采样，因此相同 sample ID 在一个 online step 最多 replay 一次；历史 prediction-time sketch 强制 stop-gradient，当前 Expert 分支保留梯度。更新后重新计算 loss/alignment：尚未恢复的样本留在 Recovery；恢复成功且 Stable 接收时迁入 Stable；恢复成功但 Stable 拒绝时直接淘汰，不会再次 replay；超过最大 replay attempts 且未恢复时同样淘汰。周期 refresh 使用完全相同的 Stable-or-Discard 语义。所有 replay、memory 和 subspace 额外 forward 都禁用 FSNet 持久状态写入。
+
+### 重复在线测试状态恢复
+
+同一个 `Exp` 第一次调用 `test()` 时，会在任何在线更新前捕获预训练后的 model state、FSNet 注册状态、Expert/Router optimizer state 和参数 `requires_grad`。后续调用 `test()` 会先恢复该 CPU 快照，再清除 gradient、Router correction、TSB buffer、Stable/Recovery memory、subspace、diagnostics 和临时计数。`grads`、`f_grads`、`q_ema`、`trigger` 已注册为 buffer，`W` 属于 model parameter，因此均包含在 `state_dict()` 中。当前不恢复 RNG state；Recovery 采样是确定性优先级排序，重复流测试使用固定输入和 seed。
 
 ### Expert update strategies
 

@@ -29,6 +29,7 @@ from utils.credit_assignment import (
 )
 from utils.expert_memory import ExpertMemoryManager, VersionedMemoryItem
 from utils.metrics import cumavg, metric
+from utils.online_checks import StrictOnlineChecker
 from utils.online_diagnostics import OnlineDiagnosticsRecorder
 from utils.online_routing import OnlineRoutingCorrection
 from utils.progressive_feedback import (
@@ -494,6 +495,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.router_grad_clip = float(getattr(args, "router_grad_clip", 0.5))
         self.router_entropy_weight = float(getattr(args, "router_entropy_weight", 1e-3))
         self.online_log_interval = int(getattr(args, "online_log_interval", 500))
+        self.max_online_steps = int(getattr(args, "max_online_steps", -1))
+        self.strict_online_checks = bool(
+            getattr(args, "strict_online_checks", False)
+        )
         self.online_step = 0
         self.fallback_count = 0
         self.fallback_channel_count = 0
@@ -626,6 +631,86 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.expert_update_count = 0
         self.completed_record_count = 0
         self.last_expert_update_diagnostics: dict[str, Any] = {}
+        self.online_checker = StrictOnlineChecker(self.strict_online_checks)
+        self._test_start_model_state: dict[str, Any] | None = None
+        self._test_start_optimizer_states: dict[str, Any] | None = None
+        self._test_start_requires_grad: dict[str, bool] | None = None
+
+    @staticmethod
+    def _state_to_cpu(value: Any) -> Any:
+        """Deep-copy nested checkpoint state without retaining GPU aliases."""
+
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {
+                key: Exp_TS2VecSupervised._state_to_cpu(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                Exp_TS2VecSupervised._state_to_cpu(item) for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                Exp_TS2VecSupervised._state_to_cpu(item) for item in value
+            )
+        return copy.deepcopy(value)
+
+    def _invalidate_test_start_state(self) -> None:
+        """Forget a baseline before training or loading a new checkpoint."""
+
+        self._test_start_model_state = None
+        self._test_start_optimizer_states = None
+        self._test_start_requires_grad = None
+
+    def _capture_test_start_state(self) -> None:
+        """Capture the post-checkpoint model and online optimizer baseline."""
+
+        if not hasattr(self, "opt_expert") or not hasattr(self, "opt_router"):
+            raise RuntimeError(
+                "online optimizers must exist before capturing test-start state"
+            )
+        self._test_start_model_state = self._state_to_cpu(
+            self.model.state_dict()
+        )
+        self._test_start_optimizer_states = {
+            "expert": self._state_to_cpu(self.opt_expert.state_dict()),
+            "router": self._state_to_cpu(self.opt_router.state_dict()),
+        }
+        self._test_start_requires_grad = {
+            name: parameter.requires_grad
+            for name, parameter in self.model.named_parameters()
+        }
+
+    def _restore_test_start_state(self) -> None:
+        """Restore parameters, FSNet buffers, optimizer moments and flags."""
+
+        if (
+            self._test_start_model_state is None
+            or self._test_start_optimizer_states is None
+            or self._test_start_requires_grad is None
+        ):
+            raise RuntimeError("test-start state has not been captured")
+        self.model.load_state_dict(self._test_start_model_state, strict=True)
+        self.opt_expert.load_state_dict(
+            self._test_start_optimizer_states["expert"]
+        )
+        self.opt_router.load_state_dict(
+            self._test_start_optimizer_states["router"]
+        )
+        for name, parameter in self.model.named_parameters():
+            parameter.requires_grad = self._test_start_requires_grad[name]
+        self.opt_expert.zero_grad(set_to_none=True)
+        self.opt_router.zero_grad(set_to_none=True)
+
+    def _prepare_test_start_state(self) -> None:
+        """Capture once, then restore the immutable baseline per test call."""
+
+        if self._test_start_model_state is None:
+            self._capture_test_start_state()
+        else:
+            self._restore_test_start_state()
 
     def _set_optimizer_lr(self, optimizer, lr):
         for group in optimizer.param_groups:
@@ -704,6 +789,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return per_expert.sum(dim=1).mean()
 
     def load_pretrained(self, checkpoint_path):
+        self._invalidate_test_start_state()
         state = torch.load(checkpoint_path, map_location=self.device)
         incompatible = self.model.load_state_dict(state, strict=False)
         allowed_missing = {"capability_projection"}
@@ -811,6 +897,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return nn.MSELoss()
 
     def train(self, setting):
+        self._invalidate_test_start_state()
         train_data, train_loader = self._get_data(flag="train")
         vali_data, vali_loader = self._get_data(flag="val")
 
@@ -1081,10 +1168,25 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 self.diagnostics.increment(recovery_attempts=1)
                 if status == "promoted":
                     self.diagnostics.increment(
-                        recovery_successes=1, promotion_count=1
+                        recovery_successes=1,
+                        recovery_to_stable=1,
+                        promotion_count=1,
                     )
+                elif status == "dropped_after_recovery":
+                    self.diagnostics.increment(
+                        recovery_successes=1,
+                        recovery_dropped_after_success=1,
+                        drop_count=1,
+                    )
+                elif status == "recovery":
+                    self.diagnostics.increment(recovery_failed=1)
                 elif status == "dropped":
-                    self.diagnostics.increment(drop_count=1)
+                    self.diagnostics.increment(
+                        recovery_failed=1,
+                        recovery_evicted=1,
+                        recovery_attempt_exhausted=1,
+                        drop_count=1,
+                    )
 
     def _assign_raw_expert_gradients(
         self, gradients: List[torch.Tensor | None]
@@ -1332,6 +1434,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
         assert tuple(expert_hce.shape) == expected_hce
         assert tuple(prior_hce.shape) == expected_hce
         assert tuple(weights_hce.shape) == expected_hce
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.prediction_bundle(
+                prediction,
+                prior_hce,
+                weights_hce,
+                self.routing_correction.z,
+                origin,
+            )
 
         record = ProgressiveForecastRecord(
             origin=origin,
@@ -1343,6 +1454,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
             mixture_prediction=mixture_hc,
             capability_sketch=capability_sketch[0],
         )
+        if checker is not None:
+            checker.new_record(record, origin)
         return (
             prediction,
             true,
@@ -1420,6 +1533,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 top_k=getattr(self.model, "top_k", self.model.num_experts),
             )
         loss_router.backward()
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.gradients(
+                self.router_params, self.progressive_origin, "Router"
+            )
         router_grad_norm = nn.utils.clip_grad_norm_(
             self.router_params, self.router_grad_clip
         )
@@ -1478,6 +1596,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
         sketch_pred = record.capability_sketch.float().to(self.device)
         cosine = (sketch_pred * sketch_now).sum(dim=-1).clamp(-1.0, 1.0)
         alignment = ((cosine + 1.0) / 2.0).clamp(0.0, 1.0)
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.alignment(alignment, current_origin)
         sketch_l2 = torch.linalg.vector_norm(
             sketch_pred - sketch_now, ord=2, dim=-1
         )
@@ -1608,6 +1729,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
             return {
                 "stable_to_recovery": 0,
                 "recovery_to_stable": 0,
+                "recovery_dropped_after_success": 0,
+                "recovery_failed": 0,
+                "recovery_evicted": 0,
+                "recovery_attempt_exhausted": 0,
                 "evicted": 0,
             }
 
@@ -1739,10 +1864,23 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 demotion_count=stats["stable_to_recovery"],
                 promotion_count=stats["recovery_to_stable"],
                 drop_count=stats["evicted"],
+                recovery_to_stable=stats.get("recovery_to_stable", 0),
+                recovery_dropped_after_success=stats.get(
+                    "recovery_dropped_after_success", 0
+                ),
+                recovery_failed=stats.get("recovery_failed", 0),
+                recovery_evicted=stats.get("recovery_evicted", 0),
+                recovery_attempt_exhausted=stats.get(
+                    "recovery_attempt_exhausted", 0
+                ),
             )
         if subspace_due:
             self._refresh_subspaces(step=timestamp)
         self._update_memory_diagnostics()
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.memory(self.memory_manager, timestamp)
+            checker.subspaces(self.subspace_protector, timestamp)
 
     def _router_only_completed_update(
         self,
@@ -1768,6 +1906,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
     ) -> None:
         """Learn with the old basis, then make the sample future evidence."""
 
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.begin_completed(completed.origin, origin)
         alignment, _, _, prediction_loss = self._evaluate_completed_record(
             completed, origin
         )
@@ -1786,6 +1927,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             )
         else:
             self._router_only_completed_update(completed)
+        if checker is not None:
+            checker.expert_updated(completed.origin, origin)
+            checker.before_memory_commit(completed.origin, origin)
         self._commit_memory_candidates(candidates)
         self.completed_record_count += 1
         self._periodic_memory_and_subspace_refresh(timestamp=origin)
@@ -1875,6 +2019,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
                         ],
                         target=event.target,
                     )
+            checker = getattr(self, "online_checker", None)
+            if checker is not None:
+                checker.feedback(events, origin)
             self._update_feedback_diagnostics(events)
             self._update_router_from_partial_feedback(events)
 
@@ -1909,7 +2056,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
 
     def _reset_progressive_online_state(
-        self, feedback_manager: ProgressiveFeedbackManager
+        self, feedback_manager: ProgressiveFeedbackManager | None
     ) -> None:
         """Reset mutable stream state without changing weights or optimizer state."""
 
@@ -1919,7 +2066,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.online_mse_ema = None
         self.fallback_count = 0
         self.fallback_channel_count = 0
-        feedback_manager.reset()
+        if feedback_manager is not None:
+            feedback_manager.reset()
         self.routing_correction.reset()
         self.memory_manager.clear()
         self.subspace_protector.reset()
@@ -1930,12 +2078,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.expert_update_count = 0
         self.completed_record_count = 0
         self.last_expert_update_diagnostics = {}
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.reset()
         self.opt_expert.zero_grad(set_to_none=True)
         self.opt_router.zero_grad(set_to_none=True)
         self.diagnostics.update(**self.subspace_protector.metrics())
         self._update_memory_diagnostics()
 
     def test(self, setting):
+        self._prepare_test_start_state()
         test_data, test_loader = self._get_data(flag="test")
 
         self.model.eval()
@@ -1959,11 +2111,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 sample_credit_temperature=self.sample_credit_temperature,
                 min_credit_eps=self.min_credit_eps,
             )
-            self._reset_progressive_online_state(progressive_manager)
             print(
                 "[PROGRESSIVE_FB] rolling origins; one newly observed timestamp "
                 "is released before each prediction"
             )
+        self._reset_progressive_online_state(progressive_manager)
         feedback_queue = (
             deque()
             if progressive_manager is None
@@ -1973,7 +2125,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
         )
         if feedback_queue is not None:
             print("[DELAY_FB] rolling origins; feedback delay={} steps".format(self.args.pred_len))
+        processed_origins = 0
         for batch_x, batch_y, batch_x_mark, batch_y_mark in tqdm(test_loader):
+            if self.max_online_steps > 0:
+                remaining = self.max_online_steps - processed_origins
+                if remaining <= 0:
+                    break
+                if batch_x.shape[0] > remaining:
+                    batch_x = batch_x[:remaining]
+                    batch_y = batch_y[:remaining]
+                    batch_x_mark = batch_x_mark[:remaining]
+                    batch_y_mark = batch_y_mark[:remaining]
             if progressive_manager is not None:
                 pred, true = self._progressive_online_batch(
                     test_data,
@@ -1993,6 +2155,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 )
             preds.append(pred.detach().cpu())
             trues.append(true.detach().cpu())
+            processed_origins += int(pred.shape[0])
             mae, mse, rmse, mape, mspe = metric(
                 pred.detach().cpu().numpy(), true.detach().cpu().numpy()
             )
@@ -2185,6 +2348,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
             alpha=tsb_alpha,
             current_lr=expert_lr,
         )
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.gradients(
+                self.expert_params, self.progressive_origin, "Expert"
+            )
         grad_norm = nn.utils.clip_grad_norm_(
             self.expert_params, self.expert_grad_clip
         )
@@ -2194,6 +2362,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.model.store_grad()
         self.expert_update_count += 1
         self._finalize_recovery_replay(recovery_batches)
+        if checker is not None:
+            checker.memory(self.memory_manager, self.progressive_origin)
         self.opt_expert.zero_grad()
         self.opt_router.zero_grad()
         diagnostics = {
@@ -2249,6 +2419,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("full-feedback Router loss is not finite")
         loss.backward()
+        checker = getattr(self, "online_checker", None)
+        if checker is not None:
+            checker.gradients(
+                self.router_params, self.progressive_origin, "Router"
+            )
         grad_norm = nn.utils.clip_grad_norm_(
             self.router_params, self.router_grad_clip
         )

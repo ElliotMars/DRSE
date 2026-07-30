@@ -236,7 +236,15 @@ class ExpertMemoryManager:
     ) -> dict[str, int]:
         """Re-evaluate snapshots, then migrate using container snapshots."""
 
-        stats = {"stable_to_recovery": 0, "recovery_to_stable": 0, "evicted": 0}
+        stats = {
+            "stable_to_recovery": 0,
+            "recovery_to_stable": 0,
+            "recovery_dropped_after_success": 0,
+            "recovery_failed": 0,
+            "recovery_evicted": 0,
+            "recovery_attempt_exhausted": 0,
+            "evicted": 0,
+        }
         stable_snapshots = [
             (expert_id, item)
             for expert_id, buffer in enumerate(self.stable_buffers)
@@ -289,10 +297,6 @@ class ExpertMemoryManager:
             item.age = max(0, int(timestamp) - item.timestamp)
             if count_recovery_attempts:
                 item.recovery_attempts += 1
-                if item.recovery_attempts > self.max_recovery_attempts:
-                    self.recovery_buffers[expert_id].remove(item.sample_id)
-                    stats["evicted"] += 1
-                    continue
             item.stable_credit = item.sample_responsibility * item.last_alignment
             item.recovery_credit = item.sample_responsibility * (
                 1.0 - item.last_alignment
@@ -301,9 +305,27 @@ class ExpertMemoryManager:
                 item.last_alignment >= self.promote_alignment_threshold
                 and item.recent_prediction_loss <= self.promote_loss_threshold
             ):
-                if self.stable_buffers[expert_id].add(item):
-                    self.recovery_buffers[expert_id].remove(item.sample_id)
+                removed = self.recovery_buffers[expert_id].remove(
+                    item.sample_id
+                )
+                if removed is None:
+                    continue
+                if self.stable_buffers[expert_id].add(removed):
                     stats["recovery_to_stable"] += 1
+                else:
+                    stats["recovery_dropped_after_success"] += 1
+                    stats["evicted"] += 1
+                continue
+            if count_recovery_attempts:
+                stats["recovery_failed"] += 1
+            if (
+                count_recovery_attempts
+                and item.recovery_attempts > self.max_recovery_attempts
+            ):
+                self.recovery_buffers[expert_id].remove(item.sample_id)
+                stats["recovery_attempt_exhausted"] += 1
+                stats["recovery_evicted"] += 1
+                stats["evicted"] += 1
         return stats
 
     def sample_recovery(
@@ -337,7 +359,13 @@ class ExpertMemoryManager:
         sample_id: int,
         alignment: float,
         prediction_loss: float,
-    ) -> Literal["recovery", "promoted", "dropped", "missing"]:
+    ) -> Literal[
+        "recovery",
+        "promoted",
+        "dropped",
+        "dropped_after_recovery",
+        "missing",
+    ]:
         """Apply one post-update Recovery result and lifecycle transition."""
 
         if not 0 <= expert_id < self.num_experts:
@@ -360,9 +388,12 @@ class ExpertMemoryManager:
             item.last_alignment >= self.promote_alignment_threshold
             and item.recent_prediction_loss <= self.promote_loss_threshold
         ):
-            if self.stable_buffers[expert_id].add(item):
-                buffer.remove(sample_id)
+            removed = buffer.remove(sample_id)
+            if removed is None:
+                return "missing"
+            if self.stable_buffers[expert_id].add(removed):
                 return "promoted"
+            return "dropped_after_recovery"
         if item.recovery_attempts > self.max_recovery_attempts:
             buffer.remove(sample_id)
             return "dropped"
