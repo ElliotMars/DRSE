@@ -85,6 +85,10 @@ def test_unresolved_recovery_stays_until_attempt_limit() -> None:
     assert manager.recovery_buffers[0].get(24).recovery_attempts == 1
     assert not manager.stable_buffers[0].contains(24)
 
+    second_status = manager.update_recovery_result(0, 24, 0.5, 0.8)
+    assert second_status == "dropped"
+    assert not manager.recovery_buffers[0].contains(24)
+
 
 def test_refresh_promotes_or_discards_successful_recovery() -> None:
     accepted = _manager()

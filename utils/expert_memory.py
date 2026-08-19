@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Literal, Optional, Set, Tuple
 
@@ -35,6 +36,34 @@ class VersionedMemoryItem:
     recovery_attempts: int = 0
     recent_prediction_loss: float = float("inf")
     normalized_sketch: Optional[torch.Tensor] = None
+    sample_confidence: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.sample_confidence = float(self.sample_confidence)
+        if not math.isfinite(self.sample_confidence):
+            raise FloatingPointError("sample_confidence contains NaN or Inf")
+        if not 0.0 <= self.sample_confidence <= 1.0:
+            raise ValueError("sample_confidence must be in [0,1]")
+        self.refresh_credit()
+
+    def refresh_credit(self) -> None:
+        """Recompute confidence-aware long-term credit at current alignment."""
+
+        self.stable_credit = (
+            self.sample_confidence
+            * self.sample_responsibility
+            * self.last_alignment
+        )
+        self.recovery_credit = (
+            self.sample_confidence
+            * self.sample_responsibility
+            * (1.0 - self.last_alignment)
+        )
+        if not (
+            math.isfinite(self.stable_credit)
+            and math.isfinite(self.recovery_credit)
+        ):
+            raise FloatingPointError("memory credit contains NaN or Inf")
 
     def to_cpu_storage(self, dtype: torch.dtype) -> "VersionedMemoryItem":
         def snapshot(tensor: torch.Tensor) -> torch.Tensor:
@@ -59,12 +88,11 @@ class VersionedMemoryItem:
 
     @property
     def stable_score(self) -> float:
-        return self.sample_responsibility * self.last_alignment
+        return self.stable_credit
 
     def recovery_score(self, failure_penalty: float) -> float:
         return (
-            self.sample_responsibility
-            * (1.0 - self.last_alignment)
+            self.recovery_credit
             / (1.0 + failure_penalty * self.recovery_attempts)
         )
 
@@ -264,10 +292,7 @@ class ExpertMemoryManager:
             item.last_alignment = float(alignment)
             item.recent_prediction_loss = float(prediction_loss)
             item.age = max(0, int(timestamp) - item.timestamp)
-            item.stable_credit = item.sample_responsibility * item.last_alignment
-            item.recovery_credit = item.sample_responsibility * (
-                1.0 - item.last_alignment
-            )
+            item.refresh_credit()
             if item.last_alignment < self.alignment_threshold:
                 demotions.append((expert_id, item))
 
@@ -297,10 +322,7 @@ class ExpertMemoryManager:
             item.age = max(0, int(timestamp) - item.timestamp)
             if count_recovery_attempts:
                 item.recovery_attempts += 1
-            item.stable_credit = item.sample_responsibility * item.last_alignment
-            item.recovery_credit = item.sample_responsibility * (
-                1.0 - item.last_alignment
-            )
+            item.refresh_credit()
             if (
                 item.last_alignment >= self.promote_alignment_threshold
                 and item.recent_prediction_loss <= self.promote_loss_threshold
@@ -320,7 +342,7 @@ class ExpertMemoryManager:
                 stats["recovery_failed"] += 1
             if (
                 count_recovery_attempts
-                and item.recovery_attempts > self.max_recovery_attempts
+                and item.recovery_attempts >= self.max_recovery_attempts
             ):
                 self.recovery_buffers[expert_id].remove(item.sample_id)
                 stats["recovery_attempt_exhausted"] += 1
@@ -380,10 +402,7 @@ class ExpertMemoryManager:
         item.recovery_attempts += 1
         item.last_alignment = float(alignment)
         item.recent_prediction_loss = float(prediction_loss)
-        item.stable_credit = item.sample_responsibility * item.last_alignment
-        item.recovery_credit = item.sample_responsibility * (
-            1.0 - item.last_alignment
-        )
+        item.refresh_credit()
         if (
             item.last_alignment >= self.promote_alignment_threshold
             and item.recent_prediction_loss <= self.promote_loss_threshold
@@ -394,7 +413,7 @@ class ExpertMemoryManager:
             if self.stable_buffers[expert_id].add(removed):
                 return "promoted"
             return "dropped_after_recovery"
-        if item.recovery_attempts > self.max_recovery_attempts:
+        if item.recovery_attempts >= self.max_recovery_attempts:
             buffer.remove(sample_id)
             return "dropped"
         return "recovery"

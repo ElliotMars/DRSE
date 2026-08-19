@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import torch
 
 from exp.exp_multi_expert import Exp_TS2VecSupervised
@@ -14,6 +16,7 @@ def _item(
     alignment: float,
     sketch: torch.Tensor,
     attempts: int = 0,
+    confidence: float = 1.0,
 ) -> VersionedMemoryItem:
     return VersionedMemoryItem(
         sample_id=sample_id,
@@ -25,9 +28,10 @@ def _item(
         prediction_capability_sketch=sketch,
         normalized_sketch=sketch,
         sample_responsibility=responsibility,
+        sample_confidence=confidence,
         last_alignment=alignment,
-        stable_credit=responsibility * alignment,
-        recovery_credit=responsibility * (1.0 - alignment),
+        stable_credit=confidence * responsibility * alignment,
+        recovery_credit=confidence * responsibility * (1.0 - alignment),
         timestamp=sample_id,
         recovery_attempts=attempts,
         recent_prediction_loss=1.0,
@@ -122,12 +126,7 @@ def test_recovery_item_is_evicted_after_attempt_limit() -> None:
     first = manager.refresh(
         lambda expert_id, item: (0.2, 1.0), timestamp=2
     )
-    second = manager.refresh(
-        lambda expert_id, item: (0.2, 1.0), timestamp=3
-    )
-
-    assert first["evicted"] == 0
-    assert second["evicted"] == 1
+    assert first["evicted"] == 1
     assert len(manager.recovery_buffers[0]) == 0
 
 
@@ -193,3 +192,80 @@ def test_recovery_replay_deduplicates_sample_across_experts() -> None:
     ]
 
     assert sampled_ids == [7]
+
+
+def test_confidence_controls_stable_and_recovery_priority() -> None:
+    stable_low = _item(40, 0.8, 0.9, torch.tensor([1.0, 0.0]), confidence=0.2)
+    stable_high = _item(41, 0.8, 0.9, torch.tensor([0.0, 1.0]), confidence=0.9)
+    recovery_low = _item(42, 0.8, 0.2, torch.tensor([1.0, 0.0]), confidence=0.2)
+    recovery_high = _item(43, 0.8, 0.2, torch.tensor([0.0, 1.0]), confidence=0.9)
+
+    assert stable_high.stable_score > stable_low.stable_score
+    assert recovery_high.recovery_score(0.5) > recovery_low.recovery_score(0.5)
+
+
+def test_refresh_preserves_confidence_in_recomputed_credit() -> None:
+    manager = _manager()
+    item = _item(44, 0.8, 0.9, torch.tensor([1.0, 0.0]), confidence=0.4)
+    assert manager.add_candidate(item) == "stable"
+
+    manager.refresh(
+        lambda expert_id, stored: (0.6, 0.5),
+        timestamp=50,
+        count_recovery_attempts=False,
+    )
+
+    stored = manager.recovery_buffers[0].get(44)
+    assert stored is not None
+    assert stored.sample_confidence == 0.4
+    assert abs(stored.stable_credit - 0.4 * 0.8 * 0.6) < 1e-12
+    assert abs(stored.recovery_credit - 0.4 * 0.8 * 0.4) < 1e-12
+
+
+def test_zero_confidence_keeps_admission_api_but_has_no_long_term_credit() -> None:
+    manager = _manager()
+    item = _item(45, 0.8, 0.9, torch.tensor([1.0, 0.0]), confidence=0.0)
+
+    assert manager.add_candidate(item) == "stable"
+    stored = manager.stable_buffers[0].get(45)
+    assert stored is not None
+    assert stored.stable_credit == 0.0
+    assert stored.recovery_credit == 0.0
+
+
+def test_nonfinite_sample_confidence_fails_fast() -> None:
+    try:
+        _item(46, 0.8, 0.9, torch.tensor([1.0, 0.0]), confidence=float("nan"))
+    except FloatingPointError:
+        pass
+    else:
+        raise AssertionError("non-finite confidence must fail fast")
+
+
+def test_memory_candidate_carries_record_sample_confidence() -> None:
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.credit_top_k = 1
+    experiment.responsibility_threshold = 0.3
+    experiment.version_awareness_enabled = True
+    experiment.recovery_enabled = True
+    experiment.alignment_threshold = 0.7
+    record = SimpleNamespace(
+        origin=50,
+        x=torch.zeros(1, 2, 1),
+        x_mark=torch.zeros(1, 2, 7),
+        matured_targets=torch.zeros(1, 1),
+        capability_sketch=torch.tensor([[1.0, 0.0], [0.0, 1.0]]),
+        sample_responsibility=torch.tensor([0.8, 0.2]),
+        sample_confidence=0.25,
+    )
+
+    candidates = experiment._build_memory_candidates(
+        record, alignment=torch.tensor([0.75, 0.5]),
+        prediction_loss=torch.tensor([0.1, 0.2]), timestamp=60,
+    )
+
+    assert len(candidates) == 1
+    item = candidates[0]
+    assert item.sample_confidence == 0.25
+    assert abs(item.stable_credit - 0.25 * 0.8 * 0.75) < 1e-7
+    assert abs(item.recovery_credit - 0.25 * 0.8 * 0.25) < 1e-7

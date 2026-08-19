@@ -7,6 +7,7 @@ largest matrix constructed here is a ``[320, 320]`` covariance matrix.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -22,6 +23,7 @@ class ExpertSubspaceState:
     effective_rank: int = 0
     stable_evidence_mass: float = 0.0
     protection_mass: float = 0.0
+    gamma: float = 1.0
     captured_energy: float = 0.0
     basis_drift: float = 0.0
     last_refresh_step: int = -1
@@ -52,6 +54,7 @@ class RegressorSubspaceProtector:
         subspace_lambda: float = 1e4,
         gamma_min: float = 0.0,
         gamma_max: float = 1.0,
+        evidence_mass_scale: float = 8.0,
     ) -> None:
         if num_experts <= 0 or feature_dim <= 0:
             raise ValueError("num_experts and feature_dim must be positive")
@@ -61,6 +64,8 @@ class RegressorSubspaceProtector:
             raise ValueError("energy_threshold must be in (0,1]")
         if min_samples <= 0 or eps <= 0 or subspace_lambda < 0:
             raise ValueError("invalid subspace scalar configuration")
+        if not math.isfinite(evidence_mass_scale) or evidence_mass_scale <= 0:
+            raise ValueError("evidence_mass_scale must be finite and positive")
         if not 0.0 <= gamma_min <= gamma_max <= 1.0:
             raise ValueError("gamma bounds must satisfy 0 <= min <= max <= 1")
 
@@ -72,6 +77,7 @@ class RegressorSubspaceProtector:
         self.min_samples = int(min_samples)
         self.eps = float(eps)
         self.subspace_lambda = float(subspace_lambda)
+        self.evidence_mass_scale = float(evidence_mass_scale)
         self.gamma_min = float(gamma_min)
         self.gamma_max = float(gamma_max)
         self.last_covariance_shape: Optional[tuple[int, int]] = None
@@ -138,6 +144,7 @@ class RegressorSubspaceProtector:
         observation_weights: torch.Tensor,
         sample_count: int,
         step: int,
+        stable_evidence_mass: Optional[float] = None,
     ) -> bool:
         """Refresh one basis from weighted ``[N,320]`` head features.
 
@@ -205,8 +212,18 @@ class RegressorSubspaceProtector:
         captured = float((selected_energy / total_energy).clamp(0.0, 1.0).item())
         old_basis = state.basis.to(new_basis)
         drift = self._basis_drift(old_basis, new_basis)
-        raw_mass = float(evidence_mass.item())
-        protection_mass = max(0.0, min(1.0, raw_mass / float(sample_count)))
+        raw_mass = (
+            float(evidence_mass.item())
+            if stable_evidence_mass is None
+            else float(stable_evidence_mass)
+        )
+        if not math.isfinite(raw_mass) or raw_mass < 0.0:
+            raise ValueError("stable_evidence_mass must be finite and non-negative")
+        protection_mass = (
+            raw_mass / (raw_mass + self.evidence_mass_scale)
+            if raw_mass > 0.0
+            else 0.0
+        )
         state.basis = new_basis.detach().cpu()
         state.eigenvalues = eigenvalues[:selected_rank].detach().cpu()
         state.effective_rank = selected_rank
@@ -221,11 +238,17 @@ class RegressorSubspaceProtector:
         """Compute soft protection strength from LR and normalized evidence."""
 
         state = self._validate_expert(expert_id)
-        if current_lr < 0:
-            raise ValueError("current_lr must be non-negative")
+        if not math.isfinite(current_lr) or current_lr < 0:
+            raise ValueError("current_lr must be finite and non-negative")
+        if state.protection_mass == 0.0:
+            state.gamma = 1.0
+            return state.gamma
         lambda_eff = self.subspace_lambda * state.protection_mass
         value = 1.0 / (1.0 + float(current_lr) * lambda_eff)
-        return max(self.gamma_min, min(self.gamma_max, value))
+        if not math.isfinite(value):
+            raise FloatingPointError("subspace gamma is not finite")
+        state.gamma = max(self.gamma_min, min(self.gamma_max, value))
+        return state.gamma
 
     @staticmethod
     def project_with_basis(
@@ -295,4 +318,6 @@ class RegressorSubspaceProtector:
             "subspace_evidence_mass": [
                 s.stable_evidence_mass for s in self.states
             ],
+            "subspace_protection_mass": [s.protection_mass for s in self.states],
+            "subspace_gamma": [s.gamma for s in self.states],
         }

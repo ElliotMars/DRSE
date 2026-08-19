@@ -1,5 +1,9 @@
-import torch
+from types import SimpleNamespace
 
+import torch
+import torch.nn as nn
+
+from exp.exp_multi_expert import Exp_TS2VecSupervised
 from utils.subspace_protection import RegressorSubspaceProtector
 
 
@@ -160,3 +164,105 @@ def test_weighted_second_moment_prioritizes_high_evidence_direction() -> None:
     first = protector.states[0].basis[:, 0]
     assert torch.abs(first[0]) > 0.999
     assert torch.abs(first[1]) < 1e-6
+
+
+def test_evidence_mass_saturates_and_gamma_is_monotonic() -> None:
+    protector = _protector(
+        rank=1, min_samples=1, subspace_lambda=100.0,
+        evidence_mass_scale=2.0,
+    )
+    features = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    weights = torch.ones(1)
+
+    assert protector.refresh_expert(
+        0, features, weights, sample_count=1, step=0,
+        stable_evidence_mass=0.0,
+    )
+    assert protector.states[0].stable_evidence_mass == 0.0
+    assert protector.states[0].protection_mass == 0.0
+    assert protector.gamma(0, current_lr=0.01) == 1.0
+
+    assert protector.refresh_expert(
+        0, features, weights, sample_count=1, step=1,
+        stable_evidence_mass=1.0,
+    )
+    low_mass = protector.states[0].protection_mass
+    low_gamma = protector.gamma(0, current_lr=0.01)
+    assert abs(low_mass - 1.0 / 3.0) < 1e-7
+
+    assert protector.refresh_expert(
+        0, features, weights, sample_count=1, step=2,
+        stable_evidence_mass=8.0,
+    )
+    high_mass = protector.states[0].protection_mass
+    high_gamma = protector.gamma(0, current_lr=0.01)
+    metrics = protector.metrics()
+
+    assert high_mass == 0.8
+    assert high_mass > low_mass
+    assert high_gamma < low_gamma
+    assert metrics["subspace_evidence_mass"] == [8.0]
+    assert metrics["subspace_protection_mass"] == [0.8]
+    assert metrics["subspace_gamma"] == [high_gamma]
+
+
+def test_evidence_mass_scale_must_be_positive_and_finite() -> None:
+    for invalid in (0.0, -1.0, float("inf"), float("nan")):
+        try:
+            _protector(evidence_mass_scale=invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid evidence mass scale must fail")
+
+
+class _HeadFeatureExpert(nn.Module):
+    def forward(self, x):
+        return x
+
+    def extract_head_features(self, x, x_mark):
+        del x_mark
+        return torch.ones(x.shape[0], 2, 4)
+
+
+class _CaptureProtector:
+    def refresh_expert(self, **kwargs):
+        self.kwargs = kwargs
+        return True
+
+
+    def metrics(self):
+        return {}
+
+
+def test_refresh_subspaces_uses_stable_credit_and_splits_channel_weight() -> None:
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.device = torch.device("cpu")
+    experiment.model = nn.Module()
+    experiment.model.experts = nn.ModuleList([_HeadFeatureExpert()])
+    items = (
+        SimpleNamespace(
+            x=torch.zeros(1, 2, 2), x_mark=torch.zeros(1, 2, 7),
+            stable_credit=0.2,
+        ),
+        SimpleNamespace(
+            x=torch.zeros(1, 2, 2), x_mark=torch.zeros(1, 2, 7),
+            stable_credit=0.8,
+        ),
+    )
+    experiment.memory_manager = SimpleNamespace(
+        stable_buffers=[SimpleNamespace(items=items)]
+    )
+    experiment.credit_weighted_subspace = True
+    experiment.subspace_protector = _CaptureProtector()
+    experiment.diagnostics = SimpleNamespace(update=lambda **kwargs: None)
+
+    experiment._refresh_subspaces(step=3)
+
+    captured = experiment.subspace_protector.kwargs
+    assert torch.allclose(
+        captured["observation_weights"],
+        torch.tensor([0.1, 0.1, 0.4, 0.4]),
+    )
+    assert captured["stable_evidence_mass"] == 1.0
+    assert captured["observation_weights"].sum() == 1.0

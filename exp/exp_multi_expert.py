@@ -21,6 +21,11 @@ from tqdm import tqdm
 from data.data_loader import Dataset_Custom, Dataset_ETT_hour, Dataset_ETT_minute, Dataset_Pred
 from exp.exp_basic import Exp_Basic
 from models.ts2vec.fsnet import TSEncoder
+from utils.comparator_evaluation import (
+    StaticComparatorAccumulator,
+    evaluate_static_comparator,
+    save_comparator_diagnostics,
+)
 from utils.credit_assignment import (
     compute_sample_credit,
     full_router_objective,
@@ -28,6 +33,10 @@ from utils.credit_assignment import (
     partial_router_objective,
 )
 from utils.expert_memory import ExpertMemoryManager, VersionedMemoryItem
+from utils.evaluation_diagnostics import (
+    SpecializationDiagnosticsAggregator,
+    compute_router_oracle_diagnostics,
+)
 from utils.metrics import cumavg, metric
 from utils.online_checks import StrictOnlineChecker
 from utils.online_diagnostics import OnlineDiagnosticsRecorder
@@ -208,8 +217,20 @@ class net(nn.Module):
         self.device = device
         self.num_experts = max(1, int(getattr(args, "num_experts", 4)))
         self.top_k = max(1, min(int(getattr(args, "top_k", self.num_experts)), self.num_experts))
-        self.num_time_experts = min(2, self.num_experts)
-        self.num_fsnet_experts = self.num_experts - self.num_time_experts
+        self.expert_composition = str(
+            getattr(args, "expert_composition", "mixed")
+        ).lower()
+        if self.expert_composition not in {"mixed", "fsnet", "fsnet_time"}:
+            raise ValueError("invalid expert_composition")
+        if self.expert_composition == "fsnet":
+            self.num_fsnet_experts = self.num_experts
+            self.num_time_experts = 0
+        elif self.expert_composition == "fsnet_time":
+            self.num_fsnet_experts = 0
+            self.num_time_experts = self.num_experts
+        else:
+            self.num_time_experts = min(2, self.num_experts)
+            self.num_fsnet_experts = self.num_experts - self.num_time_experts
         self.hidden_dim = 320
         self.c_out = args.c_out
         self.pred_len = args.pred_len
@@ -486,6 +507,20 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.expert_update_strategy = requested_strategy
         self.use_tsb = requested_strategy in {"tsb", "hybrid"}
         self.use_subspace = requested_strategy in {"subspace", "hybrid"}
+        self.tsb_smoothing_enabled = self.use_tsb and not bool(
+            getattr(args, "disable_tsb_smoothing", False)
+        )
+        self.tsb_conflict_filter_enabled = self.use_tsb and not bool(
+            getattr(args, "disable_tsb_conflict_filter", False)
+        )
+        self.tsb_reference_enabled = (
+            self.tsb_smoothing_enabled or self.tsb_conflict_filter_enabled
+        )
+        self.adaptive_controller = str(
+            getattr(args, "adaptive_controller", "dynamic")
+        ).lower()
+        if self.adaptive_controller not in {"fixed", "dynamic"}:
+            raise ValueError("invalid adaptive_controller")
         self.online_buffer = deque(maxlen=self.tsb_buffer_size)
         self.expert_params = list(self.model.experts.parameters())
         self.router_params = self.model.router_parameters()
@@ -615,11 +650,22 @@ class Exp_TS2VecSupervised(Exp_Basic):
             min_samples=int(getattr(args, "subspace_min_samples", 4)),
             eps=float(getattr(args, "subspace_eps", 1e-8)),
             subspace_lambda=float(getattr(args, "subspace_lambda", 1e4)),
+            evidence_mass_scale=float(
+                getattr(args, "subspace_evidence_mass_scale", 8.0)
+            ),
             gamma_min=float(getattr(args, "subspace_gamma_min", 0.0)),
             gamma_max=float(getattr(args, "subspace_gamma_max", 1.0)),
         )
         self.diagnostics = OnlineDiagnosticsRecorder(
             self.model.num_experts, self.online_log_interval
+        )
+        self.specialization_diagnostics = SpecializationDiagnosticsAggregator(
+            pred_len=args.pred_len,
+            c_out=args.c_out,
+            num_experts=self.model.num_experts,
+        )
+        self.comparator_diagnostics = StaticComparatorAccumulator(
+            num_experts=self.model.num_experts
         )
         self.credit_diagnostic_buffer_size = max(
             1, int(getattr(args, "credit_diagnostic_buffer_size", 10000))
@@ -719,8 +765,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
             group["lr"] = lr
 
     def _adaptive_online_hparams(self):
-        if not self.use_tsb:
-            return self.base_learning_rate_expert, self.base_learning_rate_router, 0.0
+        if self.adaptive_controller == "fixed":
+            return (
+                self.base_learning_rate_expert,
+                self.base_learning_rate_router,
+                self.tsb_alpha,
+            )
         if self.prev_online_mse is None or self.online_mse_ema is None:
             return self.base_learning_rate_expert, self.base_learning_rate_router, self.tsb_alpha
 
@@ -730,7 +780,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         lr_scale = float(np.clip(1.0 / np.sqrt(max(ratio, self.tsb_eps)), 0.1, 1.0))
         expert_lr = self.base_learning_rate_expert * lr_scale
         router_lr = self.base_learning_rate_router * lr_scale
-        dynamic_tsb_alpha = float(np.clip(self.tsb_alpha / lr_scale, self.tsb_alpha, 0.95))
+        dynamic_tsb_alpha = self.tsb_alpha
+        if self.tsb_smoothing_enabled:
+            dynamic_tsb_alpha = float(
+                np.clip(self.tsb_alpha / lr_scale, self.tsb_alpha, 0.95)
+            )
         return expert_lr, router_lr, dynamic_tsb_alpha
 
     def _update_online_mse_state(self, mse_value):
@@ -1206,8 +1260,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         current: List[torch.Tensor | None],
         reference: List[torch.Tensor] | None,
         alpha: float,
-    ) -> dict[str, float]:
-        """Apply the legacy TSB smoothing/projection to all Expert gradients."""
+    ) -> dict[str, Any]:
+        """Apply independently configured TSB smoothing and conflict filtering."""
 
         conflicts = 0
         compared = 0
@@ -1222,20 +1276,38 @@ class Exp_TS2VecSupervised(Exp_Basic):
             if ref_gradient is None:
                 filtered = gradient
             else:
-                compared += 1
-                smooth = (1.0 - alpha) * gradient + alpha * ref_gradient
-                dot = torch.sum(smooth * ref_gradient)
-                if float(dot.item()) < 0.0:
-                    conflicts += 1
-                    norm_sq = torch.sum(ref_gradient * ref_gradient) + self.tsb_eps
-                    filtered = smooth - (dot / norm_sq) * ref_gradient
+                if self.tsb_smoothing_enabled:
+                    base_gradient = (
+                        (1.0 - alpha) * gradient + alpha * ref_gradient
+                    )
                 else:
-                    filtered = smooth
+                    base_gradient = gradient
+                if self.tsb_conflict_filter_enabled:
+                    compared += 1
+                    dot = torch.sum(base_gradient * ref_gradient)
+                    if float(dot.item()) < 0.0:
+                        conflicts += 1
+                        norm_sq = (
+                            torch.sum(ref_gradient * ref_gradient)
+                            + self.tsb_eps
+                        )
+                        filtered = (
+                            base_gradient
+                            - (dot / norm_sq) * ref_gradient
+                        )
+                    else:
+                        filtered = base_gradient
+                else:
+                    filtered = base_gradient
             if not bool(torch.isfinite(filtered).all().item()):
                 raise FloatingPointError("TSB-filtered gradient is not finite")
             parameter.grad = filtered.clone()
         return {
-            "tsb_conflict_rate": conflicts / compared if compared else 0.0
+            "tsb_smoothing_enabled": self.tsb_smoothing_enabled,
+            "tsb_conflict_filter_enabled": (
+                self.tsb_conflict_filter_enabled
+            ),
+            "tsb_conflict_rate": conflicts / compared if compared else 0.0,
         }
 
     def _apply_subspace_gradient_filter(
@@ -1276,7 +1348,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
     ) -> dict[str, Any]:
         """Apply plain/TSB first and optional subspace filtering second."""
 
-        diagnostics: dict[str, Any] = {}
+        diagnostics: dict[str, Any] = {
+            "tsb_smoothing_enabled": False,
+            "tsb_conflict_filter_enabled": False,
+            "tsb_conflict_rate": 0.0,
+        }
         if self.expert_update_strategy in {"tsb", "hybrid"}:
             diagnostics.update(
                 self._apply_tsb_gradient_filter(current, reference, alpha)
@@ -1456,6 +1532,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             mixture_prediction=mixture_hc,
             capability_sketch=capability_sketch[0],
         )
+        record.metadata["expert_update_count_at_prediction"] = int(
+            self.expert_update_count
+        )
         if checker is not None:
             checker.new_record(record, origin)
         return (
@@ -1569,6 +1648,23 @@ class Exp_TS2VecSupervised(Exp_Basic):
         x = record.x.float().to(self.device)
         x_mark = record.x_mark.float().to(self.device)
         target = record.matured_targets.float().to(self.device)
+        sample_confidence = float(record.sample_confidence)
+        if not math.isfinite(sample_confidence):
+            raise FloatingPointError("sample confidence contains NaN or Inf")
+        if not 0.0 <= sample_confidence <= 1.0:
+            raise ValueError("sample confidence must be in [0,1]")
+        prediction_expert = record.expert_predictions.float().to(self.device)
+        prediction_mixture = record.mixture_prediction.float().to(self.device)
+        oracle = compute_router_oracle_diagnostics(
+            expert_predictions=prediction_expert,
+            mixture_prediction=prediction_mixture,
+            target=target,
+            eps=self.min_credit_eps,
+        )
+        prediction_expert_mse = oracle["expert_mse"].to(self.device)
+        prediction_mixture_mse = float(oracle["router_mse"])
+        best_prediction_expert_mse = float(oracle["oracle_hard_mse"])
+        router_gap = float(oracle["gap_to_hard_oracle"])
         with torch.no_grad(), self._fsnet_state_updates(False):
             current_outputs, current_representations = self.model.forward_experts(
                 x, x_mark, return_repr=True
@@ -1616,6 +1712,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
             prediction_responsibility.argmax().item()
             != current_credit.responsibility.argmax().item()
         )
+        prediction_update_count = int(
+            record.metadata.get(
+                "expert_update_count_at_prediction", self.expert_update_count
+            )
+        )
+        expert_update_delta = self.expert_update_count - prediction_update_count
+        if expert_update_delta < 0:
+            raise RuntimeError("Expert update counter moved backwards")
+        current_expert_mse = current_squared_error.mean(dim=(0, 1))
         diagnostic = {
             "origin": record.origin,
             "prediction_responsibility": (
@@ -1624,14 +1729,30 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "current_responsibility": (
                 current_credit.responsibility.detach().cpu().tolist()
             ),
+            "prediction_expert_mse": (
+                prediction_expert_mse.detach().cpu().tolist()
+            ),
+            "current_expert_mse": current_expert_mse.detach().cpu().tolist(),
             "js_divergence": float(js_divergence.item()),
             "ranking_reversal": ranking_reversal,
             "capability_alignment": alignment.detach().cpu().tolist(),
             "capability_l2_distance": sketch_l2.detach().cpu().tolist(),
-            "sample_confidence": float(record.sample_confidence),
+            "sample_confidence": sample_confidence,
             "horizon_delay": int(current_origin - record.origin),
             "pred_len": int(self.args.pred_len),
-            "expert_update_count": int(self.expert_update_count),
+            "expert_update_delta": int(expert_update_delta),
+            "global_expert_update_count": int(self.expert_update_count),
+            "prediction_mixture_mse": prediction_mixture_mse,
+            "best_prediction_expert_mse": best_prediction_expert_mse,
+            "router_gap": router_gap,
+            "oracle_hard_expert_id": int(oracle["oracle_hard_expert_id"]),
+            "oracle_hard_mse": float(oracle["oracle_hard_mse"]),
+            "oracle_top2_mse": float(oracle["oracle_top2_mse"]),
+            "oracle_top2_pair": list(oracle["oracle_top2_pair"]),
+            "oracle_top2_alpha": float(oracle["oracle_top2_alpha"]),
+            "router_mse": float(oracle["router_mse"]),
+            "gap_to_hard_oracle": float(oracle["gap_to_hard_oracle"]),
+            "gap_to_top2_oracle": float(oracle["gap_to_top2_oracle"]),
         }
         self.credit_diagnostics.append(diagnostic)
         self.credit_diagnostic_total_count += 1
@@ -1642,16 +1763,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
         ).sum()
         self.diagnostics.update(
             sample_responsibility_entropy=float(sample_entropy.item()),
-            sample_confidence=float(record.sample_confidence),
+            sample_confidence=sample_confidence,
             responsibility_js_divergence=float(js_divergence.item()),
             ranking_reversal=float(ranking_reversal),
             capability_alignment=alignment.detach().cpu().numpy(),
+            router_gap=router_gap,
         )
         return (
             alignment.detach(),
             sketch_l2.detach(),
             current_credit.responsibility.detach(),
-            current_squared_error.mean(dim=(0, 1)).detach(),
+            current_expert_mse.detach(),
         )
 
     def _build_memory_candidates(
@@ -1664,6 +1786,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         """Classify a completed record without mutating memory yet."""
 
         responsibility = record.sample_responsibility.float()
+        sample_confidence = float(record.sample_confidence)
+        if not math.isfinite(sample_confidence):
+            raise FloatingPointError("sample confidence contains NaN or Inf")
+        if not 0.0 <= sample_confidence <= 1.0:
+            raise ValueError("sample confidence must be in [0,1]")
         top_k = torch.topk(responsibility, k=self.credit_top_k).indices.tolist()
         candidates: List[VersionedMemoryItem] = []
         for expert_id in top_k:
@@ -1690,10 +1817,18 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     ],
                     normalized_sketch=record.capability_sketch[expert_id],
                     sample_responsibility=expert_responsibility,
+                    sample_confidence=sample_confidence,
                     last_alignment=expert_alignment,
-                    stable_credit=expert_responsibility * expert_alignment,
-                    recovery_credit=expert_responsibility
-                    * (1.0 - expert_alignment),
+                    stable_credit=(
+                        sample_confidence
+                        * expert_responsibility
+                        * expert_alignment
+                    ),
+                    recovery_credit=(
+                        sample_confidence
+                        * expert_responsibility
+                        * (1.0 - expert_alignment)
+                    ),
                     timestamp=timestamp,
                     recent_prediction_loss=float(
                         prediction_loss[expert_id].item()
@@ -1804,12 +1939,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
             if self.credit_weighted_subspace:
                 sample_weights = torch.tensor(
                     [
-                        item.sample_responsibility
-                        * (
-                            item.last_alignment
-                            if self.version_awareness_enabled
-                            else 1.0
-                        )
+                        item.stable_credit
                         for item in items
                     ],
                     dtype=head_features.dtype,
@@ -1835,12 +1965,14 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 )
             else:
                 raise ValueError("head features must be [B,320] or [B,C,320]")
+            stable_evidence_mass = sum(item.stable_credit for item in items)
             self.subspace_protector.refresh_expert(
                 expert_id=expert_id,
                 features=features,
                 observation_weights=observation_weights,
                 sample_count=len(items),
                 step=step,
+                stable_evidence_mass=stable_evidence_mass,
             )
         self.diagnostics.update(**self.subspace_protector.metrics())
 
@@ -1964,6 +2096,20 @@ class Exp_TS2VecSupervised(Exp_Basic):
         """Record evaluation-only metrics; ``true`` never affects an update."""
 
         target = true.reshape(self.args.pred_len, self.args.c_out).to(expert_hce)
+        specialization = getattr(self, "specialization_diagnostics", None)
+        if specialization is not None:
+            specialization.update(
+                router_weights=weights_hce,
+                expert_predictions=expert_hce,
+                target=target,
+            )
+        comparator = getattr(self, "comparator_diagnostics", None)
+        if comparator is not None:
+            comparator.update(
+                expert_predictions=expert_hce,
+                router_prediction=mixture_hc,
+                target=target,
+            )
         expert_mse = (expert_hce - target.unsqueeze(-1)).pow(2).mean(dim=(0, 1))
         mixture_mse = (mixture_hc - target).pow(2).mean()
         prior_entropy = -(
@@ -2074,6 +2220,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.memory_manager.clear()
         self.subspace_protector.reset()
         self.diagnostics.reset()
+        specialization = getattr(self, "specialization_diagnostics", None)
+        if specialization is not None:
+            specialization.reset()
+        comparator = getattr(self, "comparator_diagnostics", None)
+        if comparator is not None:
+            comparator.reset()
         self.progressive_origin = 0
         self.credit_diagnostics.clear()
         self.credit_diagnostic_total_count = 0
@@ -2196,8 +2348,36 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         npz_path, json_path = self.diagnostics.save(result_directory)
         records = list(self.credit_diagnostics)
+        num_experts = (
+            len(records[0]["capability_alignment"])
+            if records
+            else int(getattr(getattr(self, "model", None), "num_experts", 0))
+        )
+
+        def expert_field(name: str) -> np.ndarray:
+            if not records:
+                return np.empty((0, num_experts), dtype=np.float64)
+            values = np.asarray([record[name] for record in records], dtype=np.float64)
+            expected = (len(records), num_experts)
+            if values.shape != expected:
+                raise ValueError(
+                    f"credit diagnostic {name} must have shape {expected}, "
+                    f"got {values.shape}"
+                )
+            return values
+
         fields = {
             "origin": np.asarray([r["origin"] for r in records], dtype=np.int64),
+            "prediction_responsibility": expert_field(
+                "prediction_responsibility"
+            ),
+            "current_responsibility": expert_field("current_responsibility"),
+            "prediction_expert_mse": expert_field("prediction_expert_mse"),
+            "current_expert_mse": expert_field("current_expert_mse"),
+            "capability_alignment": expert_field("capability_alignment"),
+            "capability_l2_distance": expert_field(
+                "capability_l2_distance"
+            ),
             "horizon_delay": np.asarray(
                 [r["horizon_delay"] for r in records], dtype=np.int64
             ),
@@ -2222,8 +2402,50 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "sample_confidence": np.asarray(
                 [r["sample_confidence"] for r in records], dtype=np.float64
             ),
-            "expert_update_count": np.asarray(
-                [r["expert_update_count"] for r in records], dtype=np.int64
+            "expert_update_delta": np.asarray(
+                [r["expert_update_delta"] for r in records], dtype=np.int64
+            ),
+            "global_expert_update_count": np.asarray(
+                [r["global_expert_update_count"] for r in records],
+                dtype=np.int64,
+            ),
+            "prediction_mixture_mse": np.asarray(
+                [r["prediction_mixture_mse"] for r in records],
+                dtype=np.float64,
+            ),
+            "best_prediction_expert_mse": np.asarray(
+                [r["best_prediction_expert_mse"] for r in records],
+                dtype=np.float64,
+            ),
+            "router_gap": np.asarray(
+                [r["router_gap"] for r in records], dtype=np.float64
+            ),
+            "oracle_hard_expert_id": np.asarray(
+                [r["oracle_hard_expert_id"] for r in records],
+                dtype=np.int64,
+            ),
+            "oracle_hard_mse": np.asarray(
+                [r["oracle_hard_mse"] for r in records], dtype=np.float64
+            ),
+            "oracle_top2_mse": np.asarray(
+                [r["oracle_top2_mse"] for r in records], dtype=np.float64
+            ),
+            "oracle_top2_pair": np.asarray(
+                [r["oracle_top2_pair"] for r in records], dtype=np.int64
+            ).reshape(-1, 2),
+            "oracle_top2_alpha": np.asarray(
+                [r["oracle_top2_alpha"] for r in records], dtype=np.float64
+            ),
+            "router_mse": np.asarray(
+                [r["router_mse"] for r in records], dtype=np.float64
+            ),
+            "gap_to_hard_oracle": np.asarray(
+                [r["gap_to_hard_oracle"] for r in records],
+                dtype=np.float64,
+            ),
+            "gap_to_top2_oracle": np.asarray(
+                [r["gap_to_top2_oracle"] for r in records],
+                dtype=np.float64,
             ),
         }
         credit_path = os.path.join(result_directory, "credit_diagnostics.npz")
@@ -2249,8 +2471,37 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "min_alignment": (
                 float(fields["min_alignment"].min()) if retained else None
             ),
+            "mean_router_gap": (
+                float(fields["router_gap"].mean()) if retained else None
+            ),
+            "mean_gap_to_top2_oracle": (
+                float(fields["gap_to_top2_oracle"].mean())
+                if retained
+                else None
+            ),
             "file": os.path.basename(credit_path),
         }
+        specialization = getattr(self, "specialization_diagnostics", None)
+        if specialization is not None:
+            specialization_path = os.path.join(
+                result_directory, "specialization_diagnostics.npz"
+            )
+            specialization.save(specialization_path)
+            summary["specialization_diagnostics"] = {
+                "num_updates": int(specialization.num_updates),
+                "file": os.path.basename(specialization_path),
+            }
+        comparator = getattr(self, "comparator_diagnostics", None)
+        if comparator is not None:
+            comparator_result = evaluate_static_comparator(comparator)
+            comparator_npz, comparator_json = save_comparator_diagnostics(
+                comparator_result, result_directory
+            )
+            summary["comparator_diagnostics"] = {
+                **comparator_result.as_dict(),
+                "npz_file": os.path.basename(comparator_npz),
+                "json_file": os.path.basename(comparator_json),
+            }
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, ensure_ascii=False, indent=2)
         return npz_path, json_path
@@ -2289,7 +2540,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
     def _compute_tsb_reference_gradient(
         self,
     ) -> List[torch.Tensor] | None:
-        if not self.use_tsb or not self.online_buffer:
+        if not self.tsb_reference_enabled or not self.online_buffer:
             return None
         x_buffer = torch.cat([item[0] for item in self.online_buffer], dim=0)
         x_mark_buffer = torch.cat(
@@ -2524,7 +2775,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 )
                 if prediction is None:
                     prediction = expert_result["prediction"]
-                if self.use_tsb:
+                if self.adaptive_controller == "dynamic":
                     self._update_online_mse_state(
                         self._select_criterion()(
                             router_result["prediction"], y_t
@@ -2539,7 +2790,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 )
             if prediction is None:
                 raise RuntimeError("n_inner must be at least one")
-            if self.use_tsb:
+            if self.tsb_reference_enabled:
                 self.online_buffer.append(
                     (x_t.detach().clone(), x_mark_t.detach().clone(), y_t.detach().clone())
                 )

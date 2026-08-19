@@ -142,3 +142,39 @@ def test_recovery_lifecycle_and_buffer_tensors_stay_on_cpu() -> None:
 
     assert manager.update_recovery_result(0, 1, 0.95, 0.1) == "promoted"
     assert manager.stable_buffers[0].contains(1)
+
+
+def test_sampled_recovery_weight_is_confidence_aware_credit() -> None:
+    manager = ExpertMemoryManager(
+        num_experts=1, stable_capacity=1, recovery_capacity=1,
+        responsibility_threshold=0.0, alignment_threshold=0.8,
+        duplicate_threshold=0.99, failure_penalty=0.5,
+        max_recovery_attempts=2, storage_dtype="fp16",
+    )
+    confidence, responsibility, alignment = 0.25, 0.8, 0.2
+    item = VersionedMemoryItem(
+        sample_id=9, origin=9, expert_id=0,
+        x=torch.zeros(1, 2, 1), x_mark=torch.zeros(1, 2, 7),
+        target=torch.zeros(1, 1, 1),
+        prediction_capability_sketch=torch.tensor([1.0, 0.0]),
+        normalized_sketch=torch.tensor([1.0, 0.0]),
+        sample_responsibility=responsibility,
+        sample_confidence=confidence, last_alignment=alignment,
+        stable_credit=confidence * responsibility * alignment,
+        recovery_credit=confidence * responsibility * (1.0 - alignment),
+        timestamp=9,
+    )
+    assert manager.add_candidate(item) == "recovery"
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.recovery_enabled = True
+    experiment.recovery_batch_size = 1
+    experiment.recovery_loss_weight = 1.0
+    experiment.memory_manager = manager
+    experiment.model = SimpleNamespace(num_experts=1)
+    experiment.device = torch.device("cpu")
+
+    batches = experiment._sample_recovery_batches()
+
+    assert len(batches) == 1
+    expected = confidence * responsibility * (1.0 - alignment)
+    assert torch.allclose(batches[0]["responsibility"], torch.tensor([expected]))

@@ -168,13 +168,23 @@ def parse_args():
     parser.add_argument('--test_bsz', type=int, default=1)
     parser.add_argument('--n_inner', type=int, default=1)
     parser.add_argument('--num_experts', type=int, default=4, help='number of experts for multi-expert OneNet variants')
+    parser.add_argument('--expert_composition', type=str, default='mixed',
+                        choices=['mixed', 'fsnet', 'fsnet_time'],
+                        help='Expert architecture composition; mixed preserves legacy allocation')
     parser.add_argument('--top_k', type=int, default=4, help='top-k experts selected by MoE router')
     parser.add_argument('--lambda_div', type=float, default=0.0, help='weight of expert diversity loss during pretraining')
     parser.add_argument('--tsb_alpha', type=float, default=0.5, help='EMA factor for online TSB smoothing')
     parser.add_argument('--tsb_eps', type=float, default=1e-8, help='epsilon for online TSB projection')
     parser.add_argument('--tsb_buffer_size', type=int, default=8, help='buffer size for batched online TSB reference gradient')
     parser.add_argument('--disable_tsb', action='store_true', default=False,
-                        help='disable TSB reference gradients, smoothing, projection, and adaptive online step sizes')
+                        help='disable all TSB reference gradients, smoothing, and conflict filtering')
+    parser.add_argument('--disable_tsb_smoothing', action='store_true', default=False,
+                        help='disable TSB gradient smoothing while retaining optional conflict filtering')
+    parser.add_argument('--disable_tsb_conflict_filter', action='store_true', default=False,
+                        help='disable TSB conflict projection while retaining optional smoothing')
+    parser.add_argument('--adaptive_controller', type=str, default='dynamic',
+                        choices=['fixed', 'dynamic'],
+                        help='fixed or error-adaptive online Expert/Router learning rates')
     parser.add_argument('--expert_grad_clip', type=float, default=1.0)
     parser.add_argument('--router_grad_clip', type=float, default=0.5)
     parser.add_argument('--router_temperature', type=float, default=2.0)
@@ -205,7 +215,8 @@ def parse_args():
     parser.add_argument('--recovery_buffer_size', type=int, default=32)
     parser.add_argument('--buffer_duplicate_threshold', type=float, default=0.98)
     parser.add_argument('--recovery_failure_penalty', type=float, default=0.5)
-    parser.add_argument('--max_recovery_attempts', type=int, default=3)
+    parser.add_argument('--max_recovery_attempts', type=int, default=3,
+                        help='maximum failed Recovery attempts; evict on the max-th failure')
     parser.add_argument('--buffer_storage_dtype', type=str, default='fp16',
                         choices=['fp16', 'fp32'])
     parser.add_argument('--memory_refresh_interval', type=int, default=100)
@@ -224,6 +235,8 @@ def parse_args():
     parser.add_argument('--subspace_min_samples', type=int, default=4)
     parser.add_argument('--subspace_eps', type=float, default=1e-8)
     parser.add_argument('--subspace_lambda', type=float, default=1e4)
+    parser.add_argument('--subspace_evidence_mass_scale', type=float, default=8.0,
+                        help='saturation scale for normalized Stable evidence mass')
     parser.add_argument('--subspace_gamma_min', type=float, default=0.0)
     parser.add_argument('--subspace_gamma_max', type=float, default=1.0)
     parser.add_argument('--expert_update_strategy', type=str, default='tsb',
