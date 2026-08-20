@@ -9,6 +9,83 @@ from typing import Any
 import numpy as np
 
 
+class StreamingTSBGradientDiagnostics:
+    """O(1) running aggregates for TSB gradient mechanism diagnostics."""
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.reference_count = 0
+        self.modification_count = 0
+        self.projection_count = 0
+        self.grad_cosine_sum = 0.0
+        self.conflict_count = 0
+        self.modification_ratio_sum = 0.0
+        self.projection_removal_ratio_sum = 0.0
+
+    def update(
+        self,
+        *,
+        grad_cosine: float | None,
+        conflict: bool | None,
+        modification_ratio: float,
+        projection_removal_ratio: float | None,
+    ) -> None:
+        modification_ratio = float(modification_ratio)
+        if not np.isfinite(modification_ratio) or modification_ratio < 0.0:
+            raise ValueError("TSB modification ratio must be finite and non-negative")
+        self.modification_ratio_sum += modification_ratio
+        self.modification_count += 1
+
+        if grad_cosine is not None:
+            grad_cosine = float(grad_cosine)
+            if not np.isfinite(grad_cosine):
+                raise ValueError("TSB gradient cosine must be finite")
+            self.grad_cosine_sum += max(-1.0, min(1.0, grad_cosine))
+            self.conflict_count += int(bool(conflict))
+            self.reference_count += 1
+
+        if projection_removal_ratio is not None:
+            projection_removal_ratio = float(projection_removal_ratio)
+            if (
+                not np.isfinite(projection_removal_ratio)
+                or projection_removal_ratio < 0.0
+            ):
+                raise ValueError(
+                    "TSB projection removal ratio must be finite and non-negative"
+                )
+            self.projection_removal_ratio_sum += projection_removal_ratio
+            self.projection_count += 1
+
+    def metrics(self) -> dict[str, float | int | None]:
+        return {
+            "mean_grad_cosine": (
+                self.grad_cosine_sum / self.reference_count
+                if self.reference_count
+                else None
+            ),
+            "conflict_rate": (
+                self.conflict_count / self.reference_count
+                if self.reference_count
+                else None
+            ),
+            "mean_tsb_modification_ratio": (
+                self.modification_ratio_sum / self.modification_count
+                if self.modification_count
+                else None
+            ),
+            "mean_tsb_projection_removal_ratio": (
+                self.projection_removal_ratio_sum / self.projection_count
+                if self.projection_count
+                else None
+            ),
+            "reference_count": self.reference_count,
+            "modification_count": self.modification_count,
+            "projection_count": self.projection_count,
+        }
+
+
 class OnlineDiagnosticsRecorder:
     """Accumulate latest metrics and periodically materialize snapshots."""
 

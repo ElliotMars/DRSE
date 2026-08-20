@@ -380,7 +380,6 @@ class ExpertMemoryManager:
             ):
                 self.recovery_buffers[expert_id].remove(item.sample_id)
                 stats["recovery_attempt_exhausted"] += 1
-                stats["recovery_evicted"] += 1
                 stats["evicted"] += 1
         return stats
 

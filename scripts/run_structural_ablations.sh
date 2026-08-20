@@ -11,6 +11,11 @@ if [[ "$#" -eq 0 ]]; then
 fi
 
 BASE_ARGS=("$@")
+LOAD_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/path/to/checkpoint.pth}"
+if [[ "$EXECUTE" == "1" && ! -f "$LOAD_CHECKPOINT" ]]; then
+    echo "Set PRETRAINED_CHECKPOINT to run the load ablation." >&2
+    exit 2
+fi
 
 run_variant() {
     local label="$1"
@@ -30,6 +35,13 @@ run_variant() {
     fi
 }
 
+run_variant pretrain_retrain --pretrain_mode retrain
+run_variant pretrain_none --pretrain_mode none
+run_variant pretrain_load \
+    --pretrain_mode load \
+    --pretrained_checkpoint "$LOAD_CHECKPOINT"
+echo "[oracle_diagnostics] Hard, Top-2, and All-Expert oracles are emitted automatically."
+
 run_variant composition_fsnet --expert_composition fsnet
 run_variant composition_fsnet_time --expert_composition fsnet_time
 run_variant composition_mixed --expert_composition mixed
@@ -45,6 +57,10 @@ run_variant tsb_smooth_off_filter_on \
     --expert_update_strategy tsb \
     --disable_tsb_smoothing
 run_variant tsb_smooth_on_filter_on --expert_update_strategy tsb
+run_variant strategy_plain --expert_update_strategy plain
+run_variant strategy_tsb --expert_update_strategy tsb
+run_variant strategy_subspace --expert_update_strategy subspace
+run_variant strategy_hybrid --expert_update_strategy hybrid
 
 run_variant controller_fixed --adaptive_controller fixed
 run_variant controller_dynamic --adaptive_controller dynamic

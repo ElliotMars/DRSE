@@ -221,7 +221,7 @@ python -u main.py --method multi_expert --adaptive_controller fixed
 python -u main.py --method multi_expert --adaptive_controller dynamic
 ```
 
-轻量脚本默认只打印 9 条结构性 ablation 命令，不启动实验；显式设置 `EXECUTE=1` 后才执行：
+轻量脚本默认只打印 pretraining、三种自动 oracle、TSB 2×2、Expert composition、controller 和四种 Expert update strategy 的结构性 ablation 命令，不启动实验；显式设置 `EXECUTE=1` 后才执行。运行 load ablation 时通过 `PRETRAINED_CHECKPOINT` 指定 checkpoint：
 
 ```bash
 bash scripts/run_structural_ablations.sh \
@@ -289,7 +289,10 @@ bash scripts/run_progressive_credit_subspace.sh
 
 CLI global defaults 为了兼容旧实验仍是 `progressive_fb=false`、
 `router_granularity=channel` 和 `expert_update_strategy=tsb`；它们不等于
-论文 Full Method 配置。推荐直接使用
+论文 Full Method 配置。所有正式 paper online results 必须显式启用因果反馈协议：
+`--progressive_fb` 或 `--delay_fb`。在线学习开启但两者均关闭时，程序会
+在创建 experiment 前 fail-fast，因为 rolling-origin 下的完整 future-window
+immediate update 是非因果的。推荐直接使用
 `scripts/run_progressive_credit_subspace.sh`，该脚本显式启用 progressive
 feedback、`horizon_channel` Router 和 `subspace` Expert 更新。正式配置的
 关键参数如下：
@@ -307,6 +310,12 @@ feedback、`horizon_channel` Router 和 `subspace` Expert 更新。正式配置�
 脚本参数可通过前文列出的同名环境变量覆盖。修改 Full Method 配置时应显式记录
 覆盖项，不要把 CLI global defaults 当作论文配置。
 
+每个 iteration 的结果目录都会在长 test 开始前保存 `run_config.json`。该文件使用
+paper-critical 参数白名单，记录实际 causal protocol、pretrain mode、Expert composition、
+adaptive controller、TSB 开关、Stable/Recovery 与 subspace 配置、comparator 设置、seed、
+device，以及可用时的 git commit/dirty 状态；不会写入 tensor、optimizer state 或 checkpoint
+内容。重复运行只会覆盖该 iteration 目录内自己的 metadata。
+
 消融实验通过参数组合完成，无需复制实现：
 
 | 消融 | 关键参数（其余沿用新脚本默认值） |
@@ -315,12 +324,10 @@ feedback、`horizon_channel` Router 和 `subspace` Expert 更新。正式配置�
 | Neural Router + progressive z | 上述配置移除 `--disable_online_correction` |
 | Progressive correction，无 version awareness | `--disable_version_awareness` |
 | Single Stable，无 Recovery | `--disable_recovery` |
-| Stable + Recovery，无 subspace | `--expert_update_strategy plain` |
+| Plain / No Subspace | `--expert_update_strategy plain` |
 | Unweighted Stable Subspace（仅 covariance 等权） | `--disable_credit_weighted_subspace --expert_update_strategy subspace` |
-| Credit-weighted Stable Subspace（无 version awareness） | `--disable_version_awareness --expert_update_strategy subspace` |
-| Version-aware Credit-weighted Stable Subspace | `--expert_update_strategy subspace` |
-| TSB | `--expert_update_strategy tsb` |
-| Subspace | `--expert_update_strategy subspace` |
+| Full Responsibility-Conditioned Stable Subspace | `--expert_update_strategy subspace` |
+| Legacy TSB | `--expert_update_strategy tsb` |
 | Hybrid | `--expert_update_strategy hybrid` |
 
 ## 预训练与 checkpoint
@@ -333,6 +340,15 @@ python -u main.py \
   --pretrain_mode load \
   --pretrained_checkpoint /path/to/checkpoint.pth
 ```
+
+
+完全跳过 offline supervised pretraining 和 checkpoint 加载时使用：
+
+```bash
+python -u main.py ... --pretrain_mode none
+```
+
+`none` 的严格语义是 random initialization + online adaptation only。首次 `test()` 会在任何在线更新前捕获随机初始化 model 与 optimizer 状态；同一 `Exp` 后续重复测试仍恢复到该相同 initial state。
 
 常用参数：
 
@@ -407,6 +423,9 @@ python -u main.py \
 | `--adaptive_controller` | dynamic | `fixed` 或独立于 TSB 的 `dynamic` 在线 LR controller |
 | `--online_log_interval` | 500 | 在线诊断日志间隔 |
 | `--credit_diagnostic_buffer_size` | 10000 | 内存中保留的 record 级 credit 诊断上限 |
+| `--dynamic_comparator` | false | 显式启用 offline empirical K-switch comparator |
+| `--dynamic_comparator_max_switches` | 1 | K-switch comparator 允许的最大切换次数 |
+| `--dynamic_comparator_max_points` | 64 | K-switch 二次复杂度求解使用的最大有序时间块数 |
 | `--max_online_steps` | -1 | smoke test 最大 online origin 数；-1 不限制 |
 | `--strict_online_checks` | false | 开启高开销在线有限性、归一化、生命周期和顺序检查 |
 | `--seed` | 0 | iteration 基础随机种子；第 `ii` 次使用 `seed + ii` |
@@ -432,11 +451,11 @@ alignment。当前 record 没有保存 prediction-time head feature；后续若�
 
 ### 重复在线测试状态恢复
 
-同一个 `Exp` 第一次调用 `test()` 时，会在任何在线更新前捕获预训练后的 model state、FSNet 注册状态、Expert/Router optimizer state 和参数 `requires_grad`。后续调用 `test()` 会先恢复该 CPU 快照，再清除 gradient、Router correction、TSB buffer、Stable/Recovery memory、subspace、diagnostics 和临时计数。`grads`、`f_grads`、`q_ema`、`trigger` 已注册为 buffer，`W` 属于 model parameter，因此均包含在 `state_dict()` 中。当前不恢复 RNG state；Recovery 采样是确定性优先级排序，重复流测试使用固定输入和 seed。
+同一个 `Exp` 第一次调用 `test()` 时，会在任何在线更新前捕获当前 test-start baseline（预训练 checkpoint 或 `pretrain_mode=none` 的随机初始化）、FSNet 注册状态、Expert/Router optimizer state 和参数 `requires_grad`。后续调用 `test()` 会先恢复该 CPU 快照，再清除 gradient、Router correction、TSB buffer、Stable/Recovery memory、subspace、diagnostics 和临时计数。`grads`、`f_grads`、`q_ema`、`trigger` 已注册为 buffer，`W` 属于 model parameter，因此均包含在 `state_dict()` 中。当前不恢复 RNG state；Recovery 采样是确定性优先级排序，重复流测试使用固定输入和 seed。
 
 ### Expert update strategies
 
-`plain` 使用原始梯度；`tsb` 默认保留原有参考梯度平滑和冲突投影；`subspace` 不计算 TSB reference，只过滤 prediction-head weight；`hybrid` 先执行启用的 TSB 子步骤，再执行 prediction-head subspace filtering。TSB smoothing 先构造 `(1-alpha) × current + alpha × reference`，关闭 smoothing 时直接使用 current；conflict filter 只在开启且存在 reference 时投影掉负点积方向。两者都关闭时不计算 reference，结果等于 raw current gradient。`--disable_tsb` 保留兼容：与 `tsb` 冲突时降为 `plain`，与 `hybrid` 冲突时降为 `subspace`，启动时会打印 warning。区间 diagnostics 保存 `tsb_smoothing_enabled`、`tsb_conflict_filter_enabled` 与 `tsb_conflict_rate`。
+`plain`（Plain / No Subspace）使用原始梯度；`tsb`（Legacy TSB）保留参考梯度平滑和冲突投影；`subspace` 使用 Full Responsibility-Conditioned Stable Subspace，只过滤 prediction-head weight；`hybrid` 先执行启用的 TSB 子步骤，再执行 prediction-head subspace filtering。`--disable_credit_weighted_subspace` 仅得到 Unweighted Stable Subspace，即 covariance geometry 对 Stable samples 等权，仍保留 responsibility-controlled admission、version-aware lifecycle 和 evidence-adaptive gamma；当前没有实现或声称 no-responsibility GPM baseline。TSB 两个子步骤都关闭时不计算 reference，结果等于 raw current gradient。summary 中的 `tsb_gradient_diagnostics` 以 O(1) running sum/count 保存 `mean_grad_cosine`、`conflict_rate`、`mean_tsb_modification_ratio` 和可选 projection removal ratio，不保存逐参数梯度 tensor。
 
 Subspace 使用 Stable head features 构建非中心化加权二阶矩 `M = Hᵀ diag(w) H / sum(w)`，对称化后调用 `torch.linalg.eigh`。不做均值中心化，因此重复出现的同一 prediction-head activation 方向仍会被保护。实现只构建 `[320,320]` 矩阵，不会构建 `[B*C,B*C]` 矩阵；负权重会显式报错，非有限或非空但证据不足的刷新会保留旧 basis。Subspace 的样本权重直接使用 memory 中的 `item.stable_credit`；FSNet-Time 的 channel feature 都作为观测，但同一样本的 stable credit 平均分配给所有 channel，因此 channel 权重和仍等于该样本的 stable credit。Stable evidence mass 是当前 Stable 样本 `stable_credit` 的累积和 `m = Σq_stable`，保护质量使用 `m / (m + subspace_evidence_mass_scale)` 饱和归一化；随后 `lambda_eff = subspace_lambda × protection_mass`，`gamma = 1 / (1 + online_lr × lambda_eff)`。Stable buffer 变空时保留 cached basis geometry，但立即把 evidence mass 和 protection mass 置 0、gamma 置 1，因此 filtered gradient 与 raw gradient 相同。其主要额外开销是周期性 read-only feature forward、每个 Expert 一个 320 维特征协方差和至多 `subspace_max_rank` 个 basis 向量；当前只保护 `ExpertNet.regressor` 与 `FSNetTimeExpertNet.regressor_time`，不保护 encoder 层。
 
@@ -447,6 +466,43 @@ ECL 在 `seq_len=60`、`pred_len=48`、321 通道、sketch 维数 32 时，每�
 ```bash
 python main.py --help
 ```
+
+## Synthetic concept-drift benchmark
+
+Synthetic benchmark 与 ECL/ETT/WTH loader 完全分离：generator 位于 `data_provider/synthetic_drift.py`，不会改变 `data/data_loader.py` 的默认行为。它使用固定 seed 的 causal AR、正弦项、trend 和 channel mixing 生成多变量序列，并为每个 timestamp 输出 `regime_id`、transition alpha、已知 drift events 与 regime intervals。支持：
+
+- `abrupt`：A 在明确 change point 后立即切换为 B；
+- `gradual`：transition window 内以单调 alpha 从 A 混合到 B；
+- `recurring`：明确记录 `first_A`、`B`、`recurring_A` 的 A→B→A；
+- `shock`：A 中临时注入 level/noise shock，窗口结束后恢复 A；
+- `--synthetic_drift_channels 0,2`：只在指定 channel 上施加 drift，其余 channel 继续使用 A。
+
+runner 复用生产代码的 `ProgressiveFeedbackManager`、`OnlineRoutingCorrection` 和 `ExpertMemoryManager`。每个 origin 严格执行 release matured observation → progressive update/memory lifecycle → predict → evaluation-only target access；新建 record 的 future target 始终为空。轻量 Expert 只用于快速机制 benchmark，不加入或替换真实模型。
+
+脚本默认 dry-run，列出 `plain`、`tsb`、`subspace`、`hybrid` 四种策略：
+
+```bash
+bash scripts/run_synthetic_drift.sh
+
+EXECUTE=1 \
+DRIFT_TYPES="abrupt gradual recurring shock" \
+STRATEGIES="plain tsb subspace hybrid" \
+SYNTHETIC_DRIFT_CHANNELS="0,2" \
+bash scripts/run_synthetic_drift.sh
+```
+
+可用 `DISABLE_RECOVERY=1`、`DISABLE_VERSION_AWARENESS=1`、`DISABLE_Z_CORRECTION=1` 做机制关闭对照。单次直接运行示例：
+
+```bash
+python -m utils.synthetic_drift_benchmark \
+  --drift_type recurring \
+  --strategy hybrid \
+  --seq_len 12 --pred_len 3 --channels 3 --total_length 120 \
+  --synthetic_drift_channels 0,2 \
+  --output_dir result/synthetic_drift
+```
+
+每次运行保存 `predictions_and_mse.npz`、`drift_events.json`、`drift_metrics.json`、`memory_diagnostics.json` 和 `synthetic_timeline.npz`。Drift metrics 包含 pre-drift baseline、early post-drift error、peak、recovery time、cumulative excess error，以及 recurring A 的 reacquisition time 和 old-mode retention error ratio。Recovery time 是 drift 后第一个连续 `recovery_window` 的平均 MSE 不超过 `baseline × (1 + tolerance)` 的偏移；未恢复时写 JSON `null`。Memory 输出包含每个 Expert 的 Stable/Recovery occupancy timeline、按生成 regime 分解的 evidence、Stable→Recovery、Recovery→Stable、dropped-after-success、attempts-exhausted 和 mean recovery attempts。核心模块只输出数据，不生成论文图片。
 
 ## 输出
 
@@ -499,11 +555,19 @@ iteration 的 summary JSON 汇总，不加载逐步 NPZ。随机种子为
 
 Progressive Multi-Expert 诊断按 `online_log_interval` 聚合，包含 MSE、prior/effective entropy、`z` norm、Expert 权重与独立 MSE、责任与版本漂移、buffer 生命周期、Recovery 成功率、subspace rank/energy/drift、平行/正交梯度、gamma、TSB conflict rate 和 Router Gap。控制台只保留稀疏摘要。区间数组写入 `online_diagnostics.npz`。
 
-Bounded `credit_diagnostics.npz` 为每个完整 record 保存 origin、prediction/current responsibility `[E]`、prediction/current Expert MSE `[E]`、pooled-sketch `capability_alignment_existing [E]`（`capability_alignment` 为兼容别名）与 L2 distance `[E]`、JS divergence、ranking reversal、sample confidence、horizon delay、等待期间的 `expert_update_delta`、prediction-time mixture MSE 和 Router Gap；空结果仍输出 `[0,E]` Expert 字段以及 `[0,2]` top-2 pair。它还使用 prediction-time 已保存的 Expert/mixture prediction 与完整 matured target 计算 evaluation-only Hard Expert oracle 和 Top-2 convex oracle，保存 `oracle_hard_expert_id`、`oracle_hard_mse`、`oracle_top2_mse`、`oracle_top2_pair [2]`、`oracle_top2_alpha`、`router_mse`、`gap_to_hard_oracle` 与 `gap_to_top2_oracle`。这些 per-sample oracle 只用于机制诊断，不是 no-regret comparator，也不会进入 Router、Expert、`z`、memory 或 subspace 更新。summary 同时报告累计 record 数、实际保留数与估算覆盖数。
+Bounded `credit_diagnostics.npz` 为每个完整 record 保存 origin、prediction/current responsibility `[E]`、prediction/current Expert MSE `[E]`、pooled-sketch capability alignment/L2 distance `[E]`、JS divergence、ranking reversal、sample confidence、`expert_update_delta`、prediction-time mixture MSE 和 Router Gap。它还使用 prediction-time 保存的 Expert/mixture outputs 与完整 matured target 计算 evaluation-only Hard Expert、Top-2 convex 和 All-Expert convex hindsight oracle；新增字段为 `oracle_all_expert_mse`、`oracle_all_expert_weights [E]` 与 `gap_to_all_expert_oracle`。三种 oracle 都不重新运行 prediction-time model，不参与 Router、Expert、`z`、memory 或 subspace 更新，也不是 across-time constrained regret comparator。
 
 `specialization_diagnostics.npz` 使用 streaming sum/count，状态空间为 `O((H+C)E)`，不会保存逐 record 的 `H×C×E` tensor。字段为 `mean_router_weight_by_horizon [H,E]`、`mean_router_weight_by_channel [C,E]`、`expert_mse_by_horizon [H,E]`、`expert_mse_by_channel [C,E]`，以及 winning Expert rate 的同形状数组。evaluation target 只在 `_update_prediction_diagnostics()` 中更新这些统计，不参与任何训练操作。
 
-`comparator_diagnostics.npz/json` 提供 empirical static-regret evaluation。对每个 origin，以 prediction-time Expert prediction 定义 simplex 上的 mixture MSE；测试期间只累计 `E×E` Gram、`E` cross term、target norm 和 Router loss，空间为 `O(E²)`。测试结束后用 simplex projected gradient 求整个 evaluation stream 上同一个 best fixed convex mixture。输出 `router_cumulative_loss`、`static_comparator_loss`、`static_regret`、`average_static_regret = static_regret / T` 和 `static_comparator_weights [E]`。这里的 static comparator 与 per-sample Hard/Top-2 oracle 使用不同字段：oracle gap 不是 regret。当前结果只是 empirical static-regret evaluation，并不等价于现有 Router 已获得理论 no-regret proof。`evaluate_dynamic_comparator()` 仅预留接口；在明确 `≤K` switches 或 path-length constraint 等 comparator class 并具备可靠优化算法前，它会明确抛出 `NotImplementedError`，不会生成伪造的 dynamic regret。
+`comparator_diagnostics.npz/json` 使用 prediction-time Expert prediction 和测试完成后的 target 做 offline hindsight evaluation；target 不参与实际 Router prediction 或更新。Per-sample Hard/Top-2/All-Expert oracle 与下列 across-time constrained comparator 使用严格不同的名称和字段，oracle gap 不是 regret。
+
+Global Static Convex Comparator 在整个 time、horizon 和 channel 上共享一个固定 `w∈Δ^E`，最小化 `sum_t f_t(w)`。测试期间 streaming 累计 `E×E` Gram、`E` cross term、target norm 和 Router loss，空间为 `O(E²)`；测试结束后用带 tolerance 和 iteration cap 的 simplex projected gradient 求解。保留兼容字段 `static_comparator_loss`、`static_regret`、`average_static_regret`、`static_comparator_weights [E]`，并同时输出显式的 `global_static_*` 字段。
+
+Horizon-Channel Static Comparator 为每个固定 `(h,c)` 独立求一个跨时间不变的 `u_{h,c}∈Δ^E`。它批量求解 `H×C` 个小型 `E` 维 simplex quadratic，不构造跨 `(h,c)` 的巨大 Hessian；streaming 状态空间为 `O(HCE²)`。输出 `hc_static_comparator_loss`、`hc_static_regret`、`hc_average_static_regret` 和 `hc_static_comparator_weights [H,C,E]`。
+
+K-switch Dynamic Comparator 是默认关闭的 empirical hindsight comparator。显式传入 `--dynamic_comparator` 后，它把时间保留为至多 `M=dynamic_comparator_max_points` 个有序块，预计算所有 `O(M²)` segment 的 best fixed global mixture，再用 dynamic programming 找到至多 `K+1` 个 segment；因此二次问题规模受 `M` 硬限制，且不允许逐 sample 任意切换 mixture。输出 `dynamic_comparator_loss`、`dynamic_regret`、`average_dynamic_regret`、`switch_points` 和 `segment_weights`。K=0 与 Global Static Comparator 定义一致。
+
+以上结果分别是 empirical static regret 与 empirical K-switch dynamic regret，不构成或声称 Router 的 theoretical no-regret proof。`evaluate_path_length_comparator()` 仍是明确的 TODO，并抛出 `NotImplementedError`，不会用近似值冒充 exact path-length comparator。
 
 Delayed Credit-Capability 分析无需重跑模型：
 

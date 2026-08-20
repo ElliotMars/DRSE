@@ -34,10 +34,31 @@ def test_hard_and_top2_oracles_bound_single_expert_mse() -> None:
         for value in individual_mse
     )
     assert result["oracle_top2_mse"] <= result["oracle_hard_mse"] + 1e-7
+    assert result["oracle_all_expert_mse"] <= result["oracle_top2_mse"] + 1e-7
     assert result["oracle_top2_pair"] == (0, 1)
     assert result["oracle_top2_alpha"] == pytest.approx(0.5)
     assert result["oracle_top2_mse"] == pytest.approx(0.0, abs=1e-12)
     assert result["router_mse"] == pytest.approx(0.25)
+
+
+def test_all_expert_oracle_uses_three_experts_and_respects_simplex() -> None:
+    expert_predictions = torch.eye(3).unsqueeze(0).permute(0, 2, 1)
+    target = torch.full((1, 3), 1.0 / 3.0)
+    mixture = expert_predictions[..., 0]
+
+    result = compute_router_oracle_diagnostics(
+        expert_predictions, mixture, target
+    )
+
+    weights = result["oracle_all_expert_weights"]
+    assert weights.shape == (3,)
+    assert torch.all(weights >= 0.0)
+    assert float(weights.sum()) == pytest.approx(1.0, abs=1e-10)
+    assert weights.tolist() == pytest.approx([1.0 / 3.0] * 3, abs=1e-6)
+    assert result["oracle_all_expert_mse"] == pytest.approx(0.0, abs=1e-12)
+    assert result["oracle_all_expert_mse"] < result["oracle_top2_mse"]
+    assert result["oracle_top2_mse"] <= result["oracle_hard_mse"] + 1e-12
+    assert result["gap_to_all_expert_oracle"] >= result["gap_to_top2_oracle"]
 
 
 def test_oracle_evaluation_detaches_target_and_predictions() -> None:
@@ -53,6 +74,7 @@ def test_oracle_evaluation_detaches_target_and_predictions() -> None:
     )
 
     assert result["expert_mse"].requires_grad is False
+    assert result["oracle_all_expert_weights"].requires_grad is False
     assert expert_predictions.grad is None
     assert mixture_prediction.grad is None
     assert target.grad is None

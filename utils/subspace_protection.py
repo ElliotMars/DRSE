@@ -112,11 +112,43 @@ class RegressorSubspaceProtector:
         """Disable protection while retaining the cached basis geometry."""
 
         state = self._validate_expert(expert_id)
-        state.stable_evidence_mass = 0.0
-        state.protection_mass = 0.0
-        state.gamma = 1.0
+        self._update_protection_strength(
+            state, evidence_mass=0.0, current_lr=0.0
+        )
         if step is not None:
             state.last_refresh_step = int(step)
+
+    def _update_protection_strength(
+        self,
+        state: ExpertSubspaceState,
+        evidence_mass: float,
+        current_lr: float,
+    ) -> None:
+        """Update evidence strength independently of cached basis geometry."""
+
+        raw_mass = float(evidence_mass)
+        learning_rate = float(current_lr)
+        if not math.isfinite(raw_mass) or raw_mass < 0.0:
+            raise ValueError(
+                "stable_evidence_mass must be finite and non-negative"
+            )
+        if not math.isfinite(learning_rate) or learning_rate < 0.0:
+            raise ValueError("current_lr must be finite and non-negative")
+        protection_mass = (
+            raw_mass / (raw_mass + self.evidence_mass_scale)
+            if raw_mass > 0.0
+            else 0.0
+        )
+        state.stable_evidence_mass = raw_mass
+        state.protection_mass = protection_mass
+        if protection_mass == 0.0:
+            state.gamma = 1.0
+            return
+        lambda_eff = self.subspace_lambda * protection_mass
+        gamma = 1.0 / (1.0 + learning_rate * lambda_eff)
+        if not math.isfinite(gamma):
+            raise FloatingPointError("subspace gamma is not finite")
+        state.gamma = max(self.gamma_min, min(self.gamma_max, gamma))
 
     def _select_rank(self, eigenvalues: torch.Tensor) -> int:
         positive = int((eigenvalues > self.eps).sum().item())
@@ -157,11 +189,13 @@ class RegressorSubspaceProtector:
         sample_count: int,
         step: int,
         stable_evidence_mass: Optional[float] = None,
+        current_lr: float = 0.0,
     ) -> bool:
         """Refresh one basis from weighted ``[N,320]`` head features.
 
         ``observation_weights`` may contain per-channel weights for an
         FSNet-Time Expert, but their sum must represent sample-level evidence.
+        Evidence strength is refreshed even when basis geometry cannot be.
         """
 
         state = self._validate_expert(expert_id)
@@ -171,20 +205,26 @@ class RegressorSubspaceProtector:
             )
         if observation_weights.shape != (features.shape[0],):
             raise ValueError("observation_weights must have shape [N]")
+        weights = observation_weights.to(features)
+        if not bool(torch.isfinite(weights).all().item()):
+            raise ValueError("observation_weights must be finite")
+        if bool((weights < 0).any().item()):
+            raise ValueError("observation_weights must be non-negative")
+        evidence_mass = weights.sum()
+        raw_mass = (
+            float(evidence_mass.item())
+            if stable_evidence_mass is None
+            else float(stable_evidence_mass)
+        )
+        self._update_protection_strength(
+            state, evidence_mass=raw_mass, current_lr=current_lr
+        )
+
         if sample_count < self.min_samples or features.shape[0] == 0:
             return False
         if not bool(torch.isfinite(features).all().item()):
             return False
-        weights = observation_weights.to(features)
-        if not bool(torch.isfinite(weights).all().item()):
-            return False
-        if bool((weights < 0).any().item()):
-            raise ValueError("observation_weights must be non-negative")
-        evidence_mass = weights.sum()
-        if (
-            not bool(torch.isfinite(evidence_mass).item())
-            or float(evidence_mass.item()) <= self.eps
-        ):
+        if float(evidence_mass.item()) <= self.eps:
             return False
 
         # Preserve repeated activation directions with an uncentered weighted
@@ -206,7 +246,10 @@ class RegressorSubspaceProtector:
         ):
             return False
 
-        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        try:
+            eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        except RuntimeError:
+            return False
         eigenvalues = eigenvalues.flip(0).clamp_min(0.0)
         eigenvectors = eigenvectors.flip(1)
         if not (
@@ -224,25 +267,9 @@ class RegressorSubspaceProtector:
         captured = float((selected_energy / total_energy).clamp(0.0, 1.0).item())
         old_basis = state.basis.to(new_basis)
         drift = self._basis_drift(old_basis, new_basis)
-        raw_mass = (
-            float(evidence_mass.item())
-            if stable_evidence_mass is None
-            else float(stable_evidence_mass)
-        )
-        if not math.isfinite(raw_mass) or raw_mass < 0.0:
-            raise ValueError("stable_evidence_mass must be finite and non-negative")
-        protection_mass = (
-            raw_mass / (raw_mass + self.evidence_mass_scale)
-            if raw_mass > 0.0
-            else 0.0
-        )
         state.basis = new_basis.detach().cpu()
         state.eigenvalues = eigenvalues[:selected_rank].detach().cpu()
         state.effective_rank = selected_rank
-        state.stable_evidence_mass = raw_mass
-        state.protection_mass = protection_mass
-        if protection_mass == 0.0:
-            state.gamma = 1.0
         state.captured_energy = captured
         state.basis_drift = drift
         state.last_refresh_step = int(step)
@@ -254,14 +281,11 @@ class RegressorSubspaceProtector:
         state = self._validate_expert(expert_id)
         if not math.isfinite(current_lr) or current_lr < 0:
             raise ValueError("current_lr must be finite and non-negative")
-        if state.protection_mass == 0.0:
-            state.gamma = 1.0
-            return state.gamma
-        lambda_eff = self.subspace_lambda * state.protection_mass
-        value = 1.0 / (1.0 + float(current_lr) * lambda_eff)
-        if not math.isfinite(value):
-            raise FloatingPointError("subspace gamma is not finite")
-        state.gamma = max(self.gamma_min, min(self.gamma_max, value))
+        self._update_protection_strength(
+            state,
+            evidence_mass=state.stable_evidence_mass,
+            current_lr=current_lr,
+        )
         return state.gamma
 
     @staticmethod

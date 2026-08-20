@@ -222,8 +222,13 @@ if [[ "$PRETRAIN_MODE" == "load" ]]; then
     fi
     extra_args+=(--pretrained_checkpoint "$latest_ckpt")
     echo "[LOAD] data=${data} pred_len=${len} gpu=${gpu} checkpoint=${latest_ckpt}"
-else
+elif [[ "$PRETRAIN_MODE" == "retrain" ]]; then
     echo "[TRAIN] data=${data} pred_len=${len} gpu=${gpu} expert_lr=${chosen_lr} router_lr=${chosen_router_lr} online_expert_lr=${chosen_online_lr} online_router_lr=${chosen_online_router_lr} lambda_div=${chosen_lambda_div}"
+elif [[ "$PRETRAIN_MODE" == "none" ]]; then
+    echo "[NO PRETRAIN] data=${data} pred_len=${len} gpu=${gpu} random initialization + online adaptation"
+else
+    echo "PRETRAIN_MODE must be load, retrain, or none; got: $PRETRAIN_MODE" >&2
+    exit 1
 fi
 
 submit_job "$gpu" "$log_file" \

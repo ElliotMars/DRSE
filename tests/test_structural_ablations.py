@@ -7,6 +7,7 @@ import torch.nn as nn
 
 import exp.exp_multi_expert as multi_expert
 from exp.exp_multi_expert import Exp_TS2VecSupervised
+from utils.online_diagnostics import StreamingTSBGradientDiagnostics
 
 
 class _TinyExpertBase(nn.Module):
@@ -171,6 +172,91 @@ def test_tsb_reference_is_not_computed_when_both_operations_are_disabled() -> No
     assert experiment._compute_tsb_reference_gradient() is None
 
 
+@pytest.mark.parametrize(
+    "reference, expected_cosine, expected_conflict, expected_gradient",
+    [
+        ([1.0, -2.0], 1.0, False, [1.0, -2.0]),
+        ([-1.0, 2.0], -1.0, True, [0.0, 0.0]),
+    ],
+)
+def test_tsb_whole_gradient_cosine_and_projection_are_deterministic(
+    reference, expected_cosine, expected_conflict, expected_gradient
+) -> None:
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    parameter = nn.Parameter(torch.zeros(2))
+    experiment.expert_params = [parameter]
+    experiment.tsb_eps = 1e-8
+    experiment.tsb_smoothing_enabled = False
+    experiment.tsb_conflict_filter_enabled = True
+
+    diagnostics = experiment._apply_tsb_gradient_filter(
+        current=[torch.tensor([1.0, -2.0])],
+        reference=[torch.tensor(reference)],
+        alpha=0.5,
+    )
+
+    assert diagnostics["tsb_grad_cosine"] == pytest.approx(expected_cosine)
+    assert diagnostics["tsb_gradient_conflict"] is expected_conflict
+    assert torch.allclose(
+        parameter.grad, torch.tensor(expected_gradient), atol=1e-6
+    )
+    expected_ratio = 1.0 if expected_conflict else 0.0
+    assert diagnostics["tsb_modification_ratio"] == pytest.approx(
+        expected_ratio, abs=1e-6
+    )
+    if expected_conflict:
+        assert diagnostics["tsb_projection_removal_ratio"] == pytest.approx(
+            1.0, abs=1e-6
+        )
+    else:
+        assert diagnostics["tsb_projection_removal_ratio"] is None
+
+
+def test_tsb_without_reference_is_an_exact_noop_with_explicit_diagnostics() -> None:
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    parameter = nn.Parameter(torch.zeros(2))
+    experiment.expert_params = [parameter]
+    experiment.tsb_eps = 1e-8
+    experiment.tsb_smoothing_enabled = True
+    experiment.tsb_conflict_filter_enabled = True
+    current = torch.tensor([3.0, 4.0])
+
+    diagnostics = experiment._apply_tsb_gradient_filter(
+        current=[current], reference=None, alpha=0.5
+    )
+
+    assert torch.equal(parameter.grad, current)
+    assert diagnostics["tsb_reference_available"] is False
+    assert diagnostics["tsb_grad_cosine"] is None
+    assert diagnostics["tsb_gradient_conflict"] is None
+    assert diagnostics["tsb_modification_ratio"] == 0.0
+    assert diagnostics["tsb_projection_removal_ratio"] is None
+
+
+def test_tsb_streaming_diagnostics_use_constant_scalar_state() -> None:
+    diagnostics = StreamingTSBGradientDiagnostics()
+    initial_keys = set(diagnostics.__dict__)
+
+    for index in range(200):
+        diagnostics.update(
+            grad_cosine=-1.0 if index % 2 else 1.0,
+            conflict=bool(index % 2),
+            modification_ratio=0.5,
+            projection_removal_ratio=1.0 if index % 2 else None,
+        )
+
+    metrics = diagnostics.metrics()
+    assert set(diagnostics.__dict__) == initial_keys
+    assert all(
+        isinstance(value, (int, float))
+        for value in diagnostics.__dict__.values()
+    )
+    assert metrics["mean_grad_cosine"] == 0.0
+    assert metrics["conflict_rate"] == 0.5
+    assert metrics["mean_tsb_modification_ratio"] == 0.5
+    assert metrics["mean_tsb_projection_removal_ratio"] == 1.0
+
+
 def _controller(
     mode, *, smoothing, previous_mse=4.0, ema=1.0
 ) -> Exp_TS2VecSupervised:
@@ -246,6 +332,10 @@ def test_structural_ablation_cli_defaults_and_flags(monkeypatch) -> None:
     assert defaults.disable_tsb_smoothing is False
     assert defaults.disable_tsb_conflict_filter is False
     assert defaults.adaptive_controller == "dynamic"
+    assert defaults.pretrain_mode == "retrain"
+    assert defaults.dynamic_comparator is False
+    assert defaults.dynamic_comparator_max_switches == 1
+    assert defaults.dynamic_comparator_max_points == 64
 
     monkeypatch.setattr(
         sys,
@@ -256,8 +346,15 @@ def test_structural_ablation_cli_defaults_and_flags(monkeypatch) -> None:
             "fsnet_time",
             "--disable_tsb_smoothing",
             "--disable_tsb_conflict_filter",
+            "--pretrain_mode",
+            "none",
             "--adaptive_controller",
             "fixed",
+            "--dynamic_comparator",
+            "--dynamic_comparator_max_switches",
+            "2",
+            "--dynamic_comparator_max_points",
+            "32",
         ],
     )
     configured = parse_args()
@@ -265,3 +362,7 @@ def test_structural_ablation_cli_defaults_and_flags(monkeypatch) -> None:
     assert configured.disable_tsb_smoothing is True
     assert configured.disable_tsb_conflict_filter is True
     assert configured.adaptive_controller == "fixed"
+    assert configured.dynamic_comparator is True
+    assert configured.dynamic_comparator_max_switches == 2
+    assert configured.dynamic_comparator_max_points == 32
+    assert configured.pretrain_mode == "none"

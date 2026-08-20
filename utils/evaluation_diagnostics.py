@@ -11,6 +11,67 @@ import numpy as np
 import torch
 
 
+def _project_simplex(vector: torch.Tensor) -> torch.Tensor:
+    """Euclidean projection of one vector onto the probability simplex."""
+
+    sorted_values, _ = torch.sort(vector, descending=True)
+    cumulative = torch.cumsum(sorted_values, dim=0)
+    indices = torch.arange(
+        1, vector.numel() + 1, dtype=vector.dtype, device=vector.device
+    )
+    candidates = sorted_values - (cumulative - 1.0) / indices
+    positive = torch.nonzero(candidates > 0, as_tuple=False).flatten()
+    if positive.numel() == 0:
+        return torch.full_like(vector, 1.0 / vector.numel())
+    rho = int(positive[-1].item())
+    threshold = (cumulative[rho] - 1.0) / float(rho + 1)
+    projected = torch.clamp(vector - threshold, min=0.0)
+    return projected / projected.sum().clamp_min(
+        torch.finfo(projected.dtype).eps
+    )
+
+
+def _all_expert_convex_oracle(
+    predictions: torch.Tensor,
+    target: torch.Tensor,
+    initial_weights: torch.Tensor,
+    eps: float,
+    max_iterations: int = 5000,
+    tolerance: float = 1e-12,
+) -> tuple[float, torch.Tensor]:
+    """Solve one hindsight simplex least-squares problem without autograd."""
+
+    experts = predictions.shape[-1]
+    design = predictions.reshape(-1, experts).double()
+    target_vector = target.reshape(-1).double()
+    scale = 1.0 / float(target_vector.numel())
+    gram = scale * (design.T @ design)
+    cross = scale * (design.T @ target_vector)
+    weights = initial_weights.detach().double().clone()
+    initial_prediction = design @ weights
+    initial_mse = float(
+        (initial_prediction - target_vector).pow(2).mean().item()
+    )
+    largest = float(torch.linalg.eigvalsh(gram).max().clamp_min(0.0).item())
+    if largest > eps:
+        step_size = 1.0 / max(2.0 * largest, eps)
+        for _ in range(max_iterations):
+            gradient = 2.0 * (gram @ weights - cross)
+            updated = _project_simplex(weights - step_size * gradient)
+            if (
+                float(torch.linalg.vector_norm(updated - weights).item())
+                <= tolerance
+            ):
+                weights = updated
+                break
+            weights = updated
+    prediction = design @ weights
+    mse = float((prediction - target_vector).pow(2).mean().item())
+    if mse > initial_mse + 1e-10:
+        return initial_mse, initial_weights.detach().double().clone()
+    return mse, weights
+
+
 @torch.no_grad()
 def compute_router_oracle_diagnostics(
     expert_predictions: torch.Tensor,
@@ -84,6 +145,18 @@ def compute_router_oracle_diagnostics(
                 top2_pair = (first, second)
                 top2_alpha = float(alpha.item())
                 top2_mse = mse
+    top2_weights = torch.zeros(
+        experts, dtype=predictions.dtype, device=predictions.device
+    )
+    top2_weights[top2_pair[0]] += top2_alpha
+    top2_weights[top2_pair[1]] += 1.0 - top2_alpha
+    all_expert_mse, all_expert_weights = _all_expert_convex_oracle(
+        predictions=predictions,
+        target=target_value,
+        initial_weights=top2_weights,
+        eps=eps,
+    )
+
 
     router_mse = float((mixture - target_value).pow(2).mean().item())
     return {
@@ -93,9 +166,12 @@ def compute_router_oracle_diagnostics(
         "oracle_top2_mse": top2_mse,
         "oracle_top2_pair": top2_pair,
         "oracle_top2_alpha": top2_alpha,
+        "oracle_all_expert_mse": all_expert_mse,
+        "oracle_all_expert_weights": all_expert_weights.detach().cpu(),
         "router_mse": router_mse,
         "gap_to_hard_oracle": router_mse - hard_mse,
         "gap_to_top2_oracle": router_mse - top2_mse,
+        "gap_to_all_expert_oracle": router_mse - all_expert_mse,
     }
 
 

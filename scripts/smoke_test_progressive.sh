@@ -79,8 +79,10 @@ if [[ "$PRETRAIN_MODE" == "load" ]]; then
     echo "[SMOKE CONFIG] checkpoint=$CHECKPOINT"
 elif [[ "$PRETRAIN_MODE" == "retrain" ]]; then
     echo "[SMOKE CONFIG] no checkpoint: smoke test will retrain"
+elif [[ "$PRETRAIN_MODE" == "none" ]]; then
+    echo "[SMOKE CONFIG] no offline pretraining: random initialization + online adaptation"
 else
-    echo "PRETRAIN_MODE must be load or retrain, got: $PRETRAIN_MODE" >&2
+    echo "PRETRAIN_MODE must be load, retrain, or none; got: $PRETRAIN_MODE" >&2
     exit 2
 fi
 

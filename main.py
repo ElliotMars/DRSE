@@ -13,6 +13,10 @@ from utils.iteration_diagnostics import (
     annotate_iteration_summary,
     save_prediction_results,
 )
+from utils.run_config import (
+    save_run_config,
+    validate_online_feedback_protocol,
+)
 
 
 # from exp.exp_online import Exp_TS2VecSupervised
@@ -110,8 +114,16 @@ def parse_args():
     parser.add_argument('--output_attention', action='store_true', help='whether to output attention in ecoder')
     parser.add_argument('--do_predict', action='store_true', help='whether to predict unseen future data')
     parser.add_argument('--skip_test', action='store_true', default=False, help='skip test stage after training')
-    parser.add_argument('--pretrain_mode', type=str, default='retrain', choices=['retrain', 'load'],
-                        help='retrain before test or load an existing checkpoint')
+    parser.add_argument(
+        '--pretrain_mode',
+        type=str,
+        default='retrain',
+        choices=['retrain', 'load', 'none'],
+        help=(
+            'retrain before test, load an existing checkpoint, or use '
+            'random initialization with online adaptation only'
+        ),
+    )
     parser.add_argument('--pretrained_checkpoint', type=str, default='',
                         help='checkpoint path used when --pretrain_mode load')
     parser.add_argument('--checkpoint_tag', type=str, default='',
@@ -256,6 +268,12 @@ def parse_args():
                         help='deprecated compatibility option; v3 only replaces non-finite predictions')
     parser.add_argument('--online_log_interval', type=int, default=500)
     parser.add_argument('--credit_diagnostic_buffer_size', type=int, default=10000)
+    parser.add_argument('--dynamic_comparator', action='store_true', default=False,
+                        help='enable offline empirical K-switch comparator evaluation')
+    parser.add_argument('--dynamic_comparator_max_switches', type=int, default=1,
+                        help='maximum switches allowed by the offline dynamic comparator')
+    parser.add_argument('--dynamic_comparator_max_points', type=int, default=64,
+                        help='maximum ordered blocks used by K-switch O(T^2) evaluation')
     parser.add_argument('--max_online_steps', type=int, default=-1,
                         help='limit test origins for smoke tests; -1 is unlimited')
     parser.add_argument('--strict_online_checks', action='store_true', default=False,
@@ -377,8 +395,42 @@ def parse_args():
     return args
 
 
+def prepare_experiment_for_run(exp, args, setting):
+    """Apply the requested offline initialization policy before testing."""
+
+    if args.pretrain_mode == 'load':
+        if not args.pretrained_checkpoint:
+            raise ValueError(
+                '--pretrained_checkpoint is required when --pretrain_mode load'
+            )
+        print(
+            '>>>>>>>load pretrained checkpoint : '
+            '{}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(
+                args.pretrained_checkpoint
+            )
+        )
+        exp.load_pretrained(args.pretrained_checkpoint)
+        return
+    if args.pretrain_mode == 'retrain':
+        print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
+        exp.train(setting)
+        return
+    if args.pretrain_mode == 'none':
+        print(
+            '>>>>>>>no offline pretraining; random initialization + '
+            'online adaptation : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting)
+        )
+        prepare = getattr(exp, 'prepare_without_pretraining', None)
+        if prepare is not None:
+            prepare()
+        return
+    raise ValueError('invalid pretrain_mode: {}'.format(args.pretrain_mode))
+
+
 if __name__ == '__main__':
     args = parse_args()
+    causal_feedback_protocol = validate_online_feedback_protocol(args)
+    print("Causal feedback protocol:", causal_feedback_protocol)
 
     Exp = getattr(
         importlib.import_module('exp.exp_{}'.format(args.method)),
@@ -428,24 +480,13 @@ if __name__ == '__main__':
         iteration_seed = args.seed + ii
         init_dl_program(args, seed=iteration_seed)
         args.finetune_model_seed = iteration_seed
-        exp = Exp(args)
-        if args.pretrain_mode == 'load':
-            if not args.pretrained_checkpoint:
-                raise ValueError(
-                    '--pretrained_checkpoint is required when --pretrain_mode load'
-                )
-            print(
-                '>>>>>>>load pretrained checkpoint : '
-                '{}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(
-                    args.pretrained_checkpoint
-                )
-            )
-            exp.load_pretrained(args.pretrained_checkpoint)
-        else:
-            print('>>>>>>>start training : {}>>>>>>>>>>>>>>>>>>>>>>>>>>'.format(setting))
-            exp.train(setting)
-
         iteration_folder = os.path.join(folder_path, 'itr_{}'.format(ii))
+        run_config_path = save_run_config(
+            args, iteration_folder, iteration_index=ii
+        )
+        print('run config:', run_config_path)
+        exp = Exp(args)
+        prepare_experiment_for_run(exp, args, setting)
         if args.skip_test:
             print('>>>>>>>testing skipped : {}<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<'.format(setting))
             iteration_metrics = [np.nan] * 6

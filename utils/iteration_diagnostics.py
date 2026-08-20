@@ -39,6 +39,18 @@ _METRIC_SOURCES: dict[str, tuple[str, ...]] = {
     ),
     "z_norm": ("metrics", "z_norm", "mean"),
     "tsb_conflict_rate": ("metrics", "tsb_conflict_rate", "mean"),
+    "mean_grad_cosine": (
+        "tsb_gradient_diagnostics",
+        "mean_grad_cosine",
+    ),
+    "gradient_conflict_rate": (
+        "tsb_gradient_diagnostics",
+        "conflict_rate",
+    ),
+    "mean_tsb_modification_ratio": (
+        "tsb_gradient_diagnostics",
+        "mean_tsb_modification_ratio",
+    ),
 }
 
 _COUNTER_FIELDS = (

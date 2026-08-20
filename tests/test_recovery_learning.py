@@ -6,6 +6,7 @@ import torch.nn as nn
 from exp.exp_multi_expert import Exp_TS2VecSupervised
 from models.ts2vec.fsnet_ import SamePadConv
 from utils.expert_memory import ExpertMemoryManager, VersionedMemoryItem
+from utils.online_diagnostics import OnlineDiagnosticsRecorder
 from utils.recovery_learning import recovery_replay_objective
 
 
@@ -178,3 +179,50 @@ def test_sampled_recovery_weight_is_confidence_aware_credit() -> None:
     assert len(batches) == 1
     expected = confidence * responsibility * (1.0 - alignment)
     assert torch.allclose(batches[0]["responsibility"], torch.tensor([expected]))
+
+
+class _ReplayDiagnosticExpert(nn.Module):
+    def forward(self, x, x_mark, return_repr=False):
+        del x_mark
+        prediction = torch.zeros(x.shape[0], 1)
+        representation = torch.ones(x.shape[0], 2)
+        return (prediction, representation) if return_repr else prediction
+
+
+class _ReplayDiagnosticModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.experts = nn.ModuleList([_ReplayDiagnosticExpert()])
+        self.register_buffer(
+            "capability_projection", torch.eye(2).unsqueeze(0)
+        )
+
+
+def test_attempt_exhaustion_does_not_count_as_recovery_eviction() -> None:
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.device = torch.device("cpu")
+    experiment.model = _ReplayDiagnosticModel()
+    experiment.min_credit_eps = 1e-8
+    experiment.memory_manager = SimpleNamespace(
+        update_recovery_result=lambda *args: "dropped"
+    )
+    experiment.diagnostics = OnlineDiagnosticsRecorder(1, interval=1)
+    normalized = torch.nn.functional.normalize(
+        torch.ones(1, 2), dim=-1
+    )
+    batch = {
+        "expert_id": 0,
+        "items": [SimpleNamespace(sample_id=1)],
+        "x": torch.zeros(1, 2, 1),
+        "x_mark": torch.zeros(1, 2, 7),
+        "target": torch.zeros(1, 1),
+        "historical_sketch": normalized,
+    }
+
+    experiment._finalize_recovery_replay([batch])
+
+    counters = experiment.diagnostics.counters
+    assert counters["recovery_evicted"] == 0
+    assert counters["recovery_attempt_exhausted"] == 1
+    assert counters["recovery_failed"] == 1
+    assert counters["drop_count"] == 1

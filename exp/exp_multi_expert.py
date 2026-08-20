@@ -22,7 +22,10 @@ from data.data_loader import Dataset_Custom, Dataset_ETT_hour, Dataset_ETT_minut
 from exp.exp_basic import Exp_Basic
 from models.ts2vec.fsnet import TSEncoder
 from utils.comparator_evaluation import (
+    KSwitchComparatorAccumulator,
     StaticComparatorAccumulator,
+    evaluate_horizon_channel_static_comparator,
+    evaluate_k_switch_dynamic_comparator,
     evaluate_static_comparator,
     save_comparator_diagnostics,
 )
@@ -39,7 +42,10 @@ from utils.evaluation_diagnostics import (
 )
 from utils.metrics import cumavg, metric
 from utils.online_checks import StrictOnlineChecker
-from utils.online_diagnostics import OnlineDiagnosticsRecorder
+from utils.online_diagnostics import (
+    OnlineDiagnosticsRecorder,
+    StreamingTSBGradientDiagnostics,
+)
 from utils.online_routing import OnlineRoutingCorrection
 from utils.progressive_feedback import (
     ProgressiveFeedbackEvent,
@@ -659,13 +665,29 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.diagnostics = OnlineDiagnosticsRecorder(
             self.model.num_experts, self.online_log_interval
         )
+        self.tsb_gradient_diagnostics = StreamingTSBGradientDiagnostics()
         self.specialization_diagnostics = SpecializationDiagnosticsAggregator(
             pred_len=args.pred_len,
             c_out=args.c_out,
             num_experts=self.model.num_experts,
         )
         self.comparator_diagnostics = StaticComparatorAccumulator(
-            num_experts=self.model.num_experts
+            num_experts=self.model.num_experts,
+            horizon=args.pred_len,
+            channels=args.c_out,
+        )
+        self.dynamic_comparator_diagnostics = (
+            KSwitchComparatorAccumulator(
+                num_experts=self.model.num_experts,
+                max_points=int(
+                    getattr(args, "dynamic_comparator_max_points", 64)
+                ),
+            )
+            if bool(getattr(args, "dynamic_comparator", False))
+            else None
+        )
+        self.dynamic_comparator_max_switches = int(
+            getattr(args, "dynamic_comparator_max_switches", 1)
         )
         self.credit_diagnostic_buffer_size = max(
             1, int(getattr(args, "credit_diagnostic_buffer_size", 10000))
@@ -807,6 +829,21 @@ class Exp_TS2VecSupervised(Exp_Basic):
         finally:
             for module, old_value in zip(modules, previous):
                 module.state_updates_enabled = old_value
+
+    def prepare_without_pretraining(self):
+        """Initialize online optimizers for random-init evaluation."""
+
+        self._invalidate_test_start_state()
+        self.model.set_router_mode(True)
+        self.opt_expert = self._select_expert_optimizer()
+        self.opt_router = self._select_router_optimizer()
+        self._set_optimizer_lr(
+            self.opt_expert, self.base_learning_rate_expert
+        )
+        self._set_optimizer_lr(
+            self.opt_router, self.base_learning_rate_router
+        )
+        return self.model
 
 
     def _safe_prediction(self, gates, outputs):
@@ -1239,7 +1276,6 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 elif status == "dropped":
                     self.diagnostics.increment(
                         recovery_failed=1,
-                        recovery_evicted=1,
                         recovery_attempt_exhausted=1,
                         drop_count=1,
                     )
@@ -1261,10 +1297,19 @@ class Exp_TS2VecSupervised(Exp_Basic):
         reference: List[torch.Tensor] | None,
         alpha: float,
     ) -> dict[str, Any]:
-        """Apply independently configured TSB smoothing and conflict filtering."""
+        """Apply TSB and compute scalar whole-Expert mechanism diagnostics."""
 
         conflicts = 0
         compared = 0
+        diagnostic_device = self.expert_params[0].device
+        current_norm_sq = torch.zeros((), device=diagnostic_device)
+        reference_norm_sq = torch.zeros((), device=diagnostic_device)
+        current_reference_dot = torch.zeros((), device=diagnostic_device)
+        modification_norm_sq = torch.zeros((), device=diagnostic_device)
+        projection_removed_norm_sq = torch.zeros((), device=diagnostic_device)
+        projection_base_norm_sq = torch.zeros((), device=diagnostic_device)
+        has_reference = False
+        projection_applied = False
         for parameter, gradient, ref_gradient in zip(
             self.expert_params,
             current,
@@ -1273,9 +1318,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
             if gradient is None:
                 parameter.grad = None
                 continue
+            current_norm_sq += torch.sum(gradient * gradient)
             if ref_gradient is None:
                 filtered = gradient
             else:
+                has_reference = True
+                reference_norm_sq += torch.sum(ref_gradient * ref_gradient)
+                current_reference_dot += torch.sum(gradient * ref_gradient)
                 if self.tsb_smoothing_enabled:
                     base_gradient = (
                         (1.0 - alpha) * gradient + alpha * ref_gradient
@@ -1287,6 +1336,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     dot = torch.sum(base_gradient * ref_gradient)
                     if float(dot.item()) < 0.0:
                         conflicts += 1
+                        projection_applied = True
                         norm_sq = (
                             torch.sum(ref_gradient * ref_gradient)
                             + self.tsb_eps
@@ -1295,19 +1345,56 @@ class Exp_TS2VecSupervised(Exp_Basic):
                             base_gradient
                             - (dot / norm_sq) * ref_gradient
                         )
+                        projection_removed_norm_sq += torch.sum(
+                            (filtered - base_gradient).pow(2)
+                        )
+                        projection_base_norm_sq += torch.sum(
+                            base_gradient.pow(2)
+                        )
                     else:
                         filtered = base_gradient
                 else:
                     filtered = base_gradient
             if not bool(torch.isfinite(filtered).all().item()):
                 raise FloatingPointError("TSB-filtered gradient is not finite")
+            modification_norm_sq += torch.sum((filtered - gradient).pow(2))
             parameter.grad = filtered.clone()
+
+        grad_cosine = None
+        gradient_conflict = None
+        if has_reference:
+            denominator = torch.sqrt(
+                current_norm_sq * reference_norm_sq
+            ).clamp_min(self.tsb_eps)
+            grad_cosine = float(
+                (current_reference_dot / denominator).clamp(-1.0, 1.0).item()
+            )
+            gradient_conflict = grad_cosine < 0.0
+        modification_ratio = float(
+            (
+                torch.sqrt(modification_norm_sq)
+                / (torch.sqrt(current_norm_sq) + self.tsb_eps)
+            ).item()
+        )
+        projection_removal_ratio = None
+        if projection_applied:
+            projection_removal_ratio = float(
+                (
+                    torch.sqrt(projection_removed_norm_sq)
+                    / (torch.sqrt(projection_base_norm_sq) + self.tsb_eps)
+                ).item()
+            )
         return {
             "tsb_smoothing_enabled": self.tsb_smoothing_enabled,
             "tsb_conflict_filter_enabled": (
                 self.tsb_conflict_filter_enabled
             ),
             "tsb_conflict_rate": conflicts / compared if compared else 0.0,
+            "tsb_reference_available": has_reference,
+            "tsb_grad_cosine": grad_cosine,
+            "tsb_gradient_conflict": gradient_conflict,
+            "tsb_modification_ratio": modification_ratio,
+            "tsb_projection_removal_ratio": projection_removal_ratio,
         }
 
     def _apply_subspace_gradient_filter(
@@ -1352,6 +1439,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "tsb_smoothing_enabled": False,
             "tsb_conflict_filter_enabled": False,
             "tsb_conflict_rate": 0.0,
+            "tsb_reference_available": False,
+            "tsb_grad_cosine": None,
+            "tsb_gradient_conflict": None,
+            "tsb_modification_ratio": 0.0,
+            "tsb_projection_removal_ratio": None,
         }
         if self.expert_update_strategy in {"tsb", "hybrid"}:
             diagnostics.update(
@@ -1752,9 +1844,18 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "oracle_top2_mse": float(oracle["oracle_top2_mse"]),
             "oracle_top2_pair": list(oracle["oracle_top2_pair"]),
             "oracle_top2_alpha": float(oracle["oracle_top2_alpha"]),
+            "oracle_all_expert_mse": float(
+                oracle["oracle_all_expert_mse"]
+            ),
+            "oracle_all_expert_weights": oracle[
+                "oracle_all_expert_weights"
+            ].tolist(),
             "router_mse": float(oracle["router_mse"]),
             "gap_to_hard_oracle": float(oracle["gap_to_hard_oracle"]),
             "gap_to_top2_oracle": float(oracle["gap_to_top2_oracle"]),
+            "gap_to_all_expert_oracle": float(
+                oracle["gap_to_all_expert_oracle"]
+            ),
         }
         self.credit_diagnostics.append(diagnostic)
         self.credit_diagnostic_total_count += 1
@@ -1980,6 +2081,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
             else:
                 raise ValueError("head features must be [B,320] or [B,C,320]")
             stable_evidence_mass = sum(item.stable_credit for item in items)
+            current_lr = float(
+                self.opt_expert.param_groups[0]["lr"]
+                if hasattr(self, "opt_expert")
+                and self.opt_expert.param_groups
+                else getattr(self, "base_learning_rate_expert", 0.0)
+            )
             self.subspace_protector.refresh_expert(
                 expert_id=expert_id,
                 features=features,
@@ -1987,6 +2094,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 sample_count=len(items),
                 step=step,
                 stable_evidence_mass=stable_evidence_mass,
+                current_lr=current_lr,
             )
         self.diagnostics.update(**self.subspace_protector.metrics())
 
@@ -2008,6 +2116,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
         )
         if memory_due or subspace_due:
             stats = self._refresh_expert_memory(timestamp)
+            protection_deactivated = False
+            for expert_id, stable_buffer in enumerate(
+                self.memory_manager.stable_buffers
+            ):
+                if len(stable_buffer) == 0:
+                    self.subspace_protector.deactivate_protection(
+                        expert_id, step=timestamp
+                    )
+                    protection_deactivated = True
+            if protection_deactivated:
+                self.diagnostics.update(**self.subspace_protector.metrics())
             self.diagnostics.increment(
                 demotion_count=stats["stable_to_recovery"],
                 promotion_count=stats["recovery_to_stable"],
@@ -2124,6 +2243,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 router_prediction=mixture_hc,
                 target=target,
             )
+        dynamic_comparator = getattr(
+            self, "dynamic_comparator_diagnostics", None
+        )
+        if dynamic_comparator is not None:
+            dynamic_comparator.update(
+                expert_predictions=expert_hce,
+                router_prediction=mixture_hc,
+                target=target,
+            )
         expert_mse = (expert_hce - target.unsqueeze(-1)).pow(2).mean(dim=(0, 1))
         mixture_mse = (mixture_hc - target).pow(2).mean()
         prior_entropy = -(
@@ -2234,12 +2362,20 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.memory_manager.clear()
         self.subspace_protector.reset()
         self.diagnostics.reset()
+        tsb_diagnostics = getattr(self, "tsb_gradient_diagnostics", None)
+        if tsb_diagnostics is not None:
+            tsb_diagnostics.reset()
         specialization = getattr(self, "specialization_diagnostics", None)
         if specialization is not None:
             specialization.reset()
         comparator = getattr(self, "comparator_diagnostics", None)
         if comparator is not None:
             comparator.reset()
+        dynamic_comparator = getattr(
+            self, "dynamic_comparator_diagnostics", None
+        )
+        if dynamic_comparator is not None:
+            dynamic_comparator.reset()
         self.progressive_origin = 0
         self.credit_diagnostics.clear()
         self.credit_diagnostic_total_count = 0
@@ -2465,6 +2601,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "oracle_top2_alpha": np.asarray(
                 [r["oracle_top2_alpha"] for r in records], dtype=np.float64
             ),
+            "oracle_all_expert_mse": np.asarray(
+                [r["oracle_all_expert_mse"] for r in records],
+                dtype=np.float64,
+            ),
+            "oracle_all_expert_weights": expert_field(
+                "oracle_all_expert_weights"
+            ),
             "router_mse": np.asarray(
                 [r["router_mse"] for r in records], dtype=np.float64
             ),
@@ -2474,6 +2617,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
             ),
             "gap_to_top2_oracle": np.asarray(
                 [r["gap_to_top2_oracle"] for r in records],
+                dtype=np.float64,
+            ),
+            "gap_to_all_expert_oracle": np.asarray(
+                [r["gap_to_all_expert_oracle"] for r in records],
                 dtype=np.float64,
             ),
         }
@@ -2508,8 +2655,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 if retained
                 else None
             ),
+            "mean_gap_to_all_expert_oracle": (
+                float(fields["gap_to_all_expert_oracle"].mean())
+                if retained
+                else None
+            ),
             "file": os.path.basename(credit_path),
         }
+        tsb_diagnostics = getattr(self, "tsb_gradient_diagnostics", None)
+        if tsb_diagnostics is not None:
+            summary["tsb_gradient_diagnostics"] = tsb_diagnostics.metrics()
         specialization = getattr(self, "specialization_diagnostics", None)
         if specialization is not None:
             specialization_path = os.path.join(
@@ -2523,14 +2678,41 @@ class Exp_TS2VecSupervised(Exp_Basic):
         comparator = getattr(self, "comparator_diagnostics", None)
         if comparator is not None:
             comparator_result = evaluate_static_comparator(comparator)
-            comparator_npz, comparator_json = save_comparator_diagnostics(
-                comparator_result, result_directory
+            hc_statistics = comparator.horizon_channel_statistics()
+            hc_result = (
+                evaluate_horizon_channel_static_comparator(comparator)
+                if hc_statistics is not None
+                else None
             )
-            summary["comparator_diagnostics"] = {
+            dynamic_accumulator = getattr(
+                self, "dynamic_comparator_diagnostics", None
+            )
+            dynamic_result = (
+                evaluate_k_switch_dynamic_comparator(
+                    dynamic_accumulator,
+                    max_switches=int(
+                        getattr(self, "dynamic_comparator_max_switches", 1)
+                    ),
+                )
+                if dynamic_accumulator is not None
+                else None
+            )
+            comparator_npz, comparator_json = save_comparator_diagnostics(
+                comparator_result,
+                result_directory,
+                hc_result=hc_result,
+                dynamic_result=dynamic_result,
+            )
+            comparator_summary = {
                 **comparator_result.as_dict(),
                 "npz_file": os.path.basename(comparator_npz),
                 "json_file": os.path.basename(comparator_json),
             }
+            if hc_result is not None:
+                comparator_summary.update(hc_result.as_dict())
+            if dynamic_result is not None:
+                comparator_summary.update(dynamic_result.as_dict())
+            summary["comparator_diagnostics"] = comparator_summary
         with open(json_path, "w", encoding="utf-8") as handle:
             json.dump(summary, handle, ensure_ascii=False, indent=2)
         return npz_path, json_path
@@ -2634,6 +2816,28 @@ class Exp_TS2VecSupervised(Exp_Basic):
             alpha=tsb_alpha,
             current_lr=expert_lr,
         )
+        tsb_aggregate_metrics = {}
+        tsb_aggregator = getattr(self, "tsb_gradient_diagnostics", None)
+        if (
+            tsb_aggregator is not None
+            and self.expert_update_strategy in {"tsb", "hybrid"}
+        ):
+            tsb_aggregator.update(
+                grad_cosine=strategy_metrics["tsb_grad_cosine"],
+                conflict=strategy_metrics["tsb_gradient_conflict"],
+                modification_ratio=strategy_metrics[
+                    "tsb_modification_ratio"
+                ],
+                projection_removal_ratio=strategy_metrics[
+                    "tsb_projection_removal_ratio"
+                ],
+            )
+            tsb_aggregate_metrics = {
+                key: value
+                for key, value in tsb_aggregator.metrics().items()
+                if value is not None
+            }
+
         checker = getattr(self, "online_checker", None)
         if checker is not None:
             checker.gradients(
@@ -2653,6 +2857,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.opt_expert.zero_grad()
         self.opt_router.zero_grad()
         diagnostics = {
+            **tsb_aggregate_metrics,
             **strategy_metrics,
             **recovery_metrics,
             "expert_gradient_norm": float(grad_norm.item()),
@@ -2752,6 +2957,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 float(torch.linalg.vector_norm(self.routing_correction.z).item()),
             )
         )
+
 
     def _ol_one_batch(
         self,

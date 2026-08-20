@@ -187,6 +187,8 @@ def test_recovery_item_is_evicted_after_attempt_limit() -> None:
         lambda expert_id, item: (0.2, 1.0), timestamp=2
     )
     assert first["evicted"] == 1
+    assert first["recovery_evicted"] == 0
+    assert first["recovery_attempt_exhausted"] == 1
     assert len(manager.recovery_buffers[0]) == 0
 
 

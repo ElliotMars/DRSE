@@ -125,6 +125,8 @@ def test_refresh_promotes_or_discards_successful_recovery() -> None:
     )
     assert rejected_stats["recovery_to_stable"] == 0
     assert rejected_stats["recovery_dropped_after_success"] == 1
+    assert rejected_stats["recovery_evicted"] == 0
+    assert rejected_stats["recovery_attempt_exhausted"] == 0
     assert rejected_stats["evicted"] == 1
     assert not rejected.stable_buffers[0].contains(33)
     assert not rejected.recovery_buffers[0].contains(33)

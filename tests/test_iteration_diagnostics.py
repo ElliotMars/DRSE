@@ -66,6 +66,31 @@ def test_two_iterations_are_isolated_and_aggregated(tmp_path) -> None:
     assert json.loads(output.read_text()) == aggregate
 
 
+def test_tsb_streaming_summary_metrics_are_aggregated() -> None:
+    aggregate = aggregate_online_diagnostics(
+        [
+            {
+                "tsb_gradient_diagnostics": {
+                    "mean_grad_cosine": 0.5,
+                    "conflict_rate": 0.25,
+                    "mean_tsb_modification_ratio": 0.1,
+                }
+            },
+            {
+                "tsb_gradient_diagnostics": {
+                    "mean_grad_cosine": -0.5,
+                    "conflict_rate": 0.75,
+                    "mean_tsb_modification_ratio": 0.3,
+                }
+            },
+        ]
+    )
+
+    assert aggregate["metrics"]["mean_grad_cosine"]["mean"] == 0.0
+    assert aggregate["metrics"]["gradient_conflict_rate"]["mean"] == 0.5
+    assert aggregate["metrics"]["mean_tsb_modification_ratio"]["mean"] == 0.2
+
+
 def test_single_iteration_keeps_legacy_prediction_filenames(tmp_path) -> None:
     summary_path = _write_iteration(tmp_path, 0, 7, 2.5, None)
     aggregate = aggregate_online_diagnostics([summary_path])

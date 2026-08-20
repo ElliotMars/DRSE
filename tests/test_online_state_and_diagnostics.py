@@ -9,7 +9,10 @@ from exp.exp_multi_expert import Exp_TS2VecSupervised
 from utils.comparator_evaluation import StaticComparatorAccumulator
 from utils.expert_memory import ExpertMemoryManager
 from utils.evaluation_diagnostics import SpecializationDiagnosticsAggregator
-from utils.online_diagnostics import OnlineDiagnosticsRecorder
+from utils.online_diagnostics import (
+    OnlineDiagnosticsRecorder,
+    StreamingTSBGradientDiagnostics,
+)
 from utils.online_routing import OnlineRoutingCorrection
 from utils.progressive_feedback import (
     ProgressiveFeedbackManager,
@@ -24,6 +27,9 @@ def _credit_record(origin: int, js: float, alignment: list[float]) -> dict:
     prediction_mse = [float(origin + index) for index in range(experts)]
     mixture_mse = float(origin) + 0.5
     best_mse = min(prediction_mse)
+    hard_expert_id = int(np.argmin(prediction_mse))
+    all_expert_weights = [0.0] * experts
+    all_expert_weights[hard_expert_id] = 1.0
     return {
         "origin": origin,
         "horizon_delay": 2,
@@ -42,14 +48,17 @@ def _credit_record(origin: int, js: float, alignment: list[float]) -> dict:
         "prediction_mixture_mse": mixture_mse,
         "best_prediction_expert_mse": best_mse,
         "router_gap": mixture_mse - best_mse,
-        "oracle_hard_expert_id": int(np.argmin(prediction_mse)),
+        "oracle_hard_expert_id": hard_expert_id,
         "oracle_hard_mse": best_mse,
         "oracle_top2_mse": best_mse,
         "oracle_top2_pair": [0, 1] if experts > 1 else [0, 0],
         "oracle_top2_alpha": 1.0,
+        "oracle_all_expert_mse": best_mse,
+        "oracle_all_expert_weights": all_expert_weights,
         "router_mse": mixture_mse,
         "gap_to_hard_oracle": mixture_mse - best_mse,
         "gap_to_top2_oracle": mixture_mse - best_mse,
+        "gap_to_all_expert_oracle": mixture_mse - best_mse,
     }
 
 
@@ -86,6 +95,7 @@ def test_credit_diagnostics_are_bounded_and_persisted(tmp_path) -> None:
         arrays["capability_alignment"],
     )
     assert arrays["capability_l2_distance"].shape == (2, 2)
+    assert arrays["oracle_all_expert_weights"].shape == (2, 2)
     assert arrays["expert_update_delta"].tolist() == [1, 2]
     with open(summary_path, "r", encoding="utf-8") as handle:
         summary = json.load(handle)["credit_diagnostics"]
@@ -154,6 +164,13 @@ def test_progressive_reset_clears_stream_state_without_changing_parameters() -> 
     experiment.subspace_protector.states[0].basis = torch.ones(2, 1)
     experiment.subspace_protector.states[0].effective_rank = 1
     experiment.diagnostics = OnlineDiagnosticsRecorder(1, interval=1)
+    experiment.tsb_gradient_diagnostics = StreamingTSBGradientDiagnostics()
+    experiment.tsb_gradient_diagnostics.update(
+        grad_cosine=-1.0,
+        conflict=True,
+        modification_ratio=1.0,
+        projection_removal_ratio=1.0,
+    )
     experiment.diagnostics.update(online_mse=2.0)
     experiment.diagnostics.maybe_record(1)
     manager = ProgressiveFeedbackManager(pred_len=2, c_out=1)
@@ -176,6 +193,7 @@ def test_progressive_reset_clears_stream_state_without_changing_parameters() -> 
     assert experiment.expert_update_count == 0
     assert experiment.completed_record_count == 0
     assert experiment.last_expert_update_diagnostics == {}
+    assert experiment.tsb_gradient_diagnostics.reference_count == 0
     assert expert_parameter.grad is None and router_parameter.grad is None
     assert torch.equal(expert_parameter, parameter_snapshots[0])
     assert torch.equal(router_parameter, parameter_snapshots[1])
@@ -249,8 +267,11 @@ def test_completed_record_diagnostic_uses_prediction_snapshot_and_version_delta(
     assert diagnostic["oracle_hard_mse"] == 0.0
     assert diagnostic["oracle_top2_mse"] == 0.0
     assert diagnostic["oracle_top2_pair"] == [0, 1]
+    assert diagnostic["oracle_all_expert_mse"] == 0.0
+    assert diagnostic["oracle_all_expert_weights"] == [1.0, 0.0]
     assert diagnostic["gap_to_hard_oracle"] == 2.25
     assert diagnostic["gap_to_top2_oracle"] == 2.25
+    assert diagnostic["gap_to_all_expert_oracle"] == 2.25
     assert all(parameter.grad is None for parameter in experiment.model.parameters())
 
     experiment.save_online_diagnostics(str(tmp_path))
@@ -266,6 +287,7 @@ def test_completed_record_diagnostic_uses_prediction_snapshot_and_version_delta(
     assert arrays["router_gap"].tolist() == [2.25]
     assert arrays["oracle_hard_expert_id"].tolist() == [0]
     assert arrays["oracle_top2_pair"].shape == (1, 2)
+    assert arrays["oracle_all_expert_weights"].shape == (1, 2)
     assert arrays["gap_to_top2_oracle"].tolist() == [2.25]
 
 
@@ -288,6 +310,7 @@ def test_empty_credit_diagnostics_keep_two_dimensional_expert_fields(tmp_path) -
     assert arrays["capability_alignment_existing"].shape == (0, 2)
     assert arrays["capability_alignment"].shape == (0, 2)
     assert arrays["oracle_top2_pair"].shape == (0, 2)
+    assert arrays["oracle_all_expert_weights"].shape == (0, 2)
     specialization = np.load(tmp_path / "specialization_diagnostics.npz")
     assert specialization["mean_router_weight_by_horizon"].shape == (2, 2)
     assert specialization["mean_router_weight_by_channel"].shape == (1, 2)
@@ -298,4 +321,6 @@ def test_empty_credit_diagnostics_keep_two_dimensional_expert_fields(tmp_path) -
         tmp_path / "comparator_diagnostics.json", "r", encoding="utf-8"
     ) as handle:
         comparator_json = json.load(handle)
-    assert comparator_json["comparator_type"] == "static_fixed_convex_mixture"
+    assert comparator_json["comparator_type"] == (
+        "global_static_convex_comparator"
+    )
