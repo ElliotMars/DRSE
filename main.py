@@ -245,7 +245,8 @@ def parse_args():
                         default=False)
     parser.add_argument('--disable_recovery', action='store_true', default=False)
     parser.add_argument('--disable_credit_weighted_subspace', action='store_true',
-                        default=False)
+                        default=False,
+                        help='use uniform Stable-sample weights only for subspace covariance geometry; memory admission and evidence-adaptive gamma remain enabled')
     parser.add_argument('--disable_online_correction', action='store_true',
                         default=False)
     parser.add_argument('--disable_expert_online_update', action='store_true',

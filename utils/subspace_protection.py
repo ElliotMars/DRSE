@@ -106,6 +106,18 @@ class RegressorSubspaceProtector:
             raise IndexError("invalid expert_id")
         return self.states[expert_id]
 
+    def deactivate_protection(
+        self, expert_id: int, step: Optional[int] = None
+    ) -> None:
+        """Disable protection while retaining the cached basis geometry."""
+
+        state = self._validate_expert(expert_id)
+        state.stable_evidence_mass = 0.0
+        state.protection_mass = 0.0
+        state.gamma = 1.0
+        if step is not None:
+            state.last_refresh_step = int(step)
+
     def _select_rank(self, eigenvalues: torch.Tensor) -> int:
         positive = int((eigenvalues > self.eps).sum().item())
         available = min(positive, self.max_rank)
@@ -229,6 +241,8 @@ class RegressorSubspaceProtector:
         state.effective_rank = selected_rank
         state.stable_evidence_mass = raw_mass
         state.protection_mass = protection_mass
+        if protection_mass == 0.0:
+            state.gamma = 1.0
         state.captured_energy = captured
         state.basis_drift = drift
         state.last_refresh_step = int(step)
@@ -288,6 +302,14 @@ class RegressorSubspaceProtector:
                 perpendicular_norm=float(torch.linalg.vector_norm(gradient).item()),
                 gamma=1.0,
                 rank=0,
+            )
+            return gradient, stats
+        if state.protection_mass == 0.0:
+            stats = GradientProjectionStats(
+                parallel_norm=0.0,
+                perpendicular_norm=float(torch.linalg.vector_norm(gradient).item()),
+                gamma=1.0,
+                rank=state.effective_rank,
             )
             return gradient, stats
         gamma = (

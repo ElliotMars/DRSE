@@ -84,6 +84,66 @@ def test_full_buffer_replaces_only_lower_score() -> None:
     assert not buffer.add(_item(4, 0.1, 0.5, torch.tensor([1.0, 1.0, 0.0])))
 
 
+def test_recovery_buffer_reports_capacity_replacement() -> None:
+    buffer = FixedCapacityExpertBuffer(
+        capacity=1,
+        kind="recovery",
+        duplicate_threshold=0.95,
+        failure_penalty=0.5,
+    )
+    first = _item(10, 0.4, 0.6, torch.tensor([1.0, 0.0]))
+    replacement = _item(11, 1.0, 0.0, torch.tensor([0.0, 1.0]))
+    assert buffer.add(first)
+
+    result = buffer.add_with_result(replacement)
+
+    assert result.accepted
+    assert result.reason == "replaced"
+    assert result.replaced_item is first
+    assert not buffer.contains(10)
+    assert buffer.contains(11)
+
+
+def test_stable_demotion_counts_recovery_capacity_eviction() -> None:
+    manager = ExpertMemoryManager(
+        num_experts=1,
+        stable_capacity=2,
+        recovery_capacity=1,
+        responsibility_threshold=0.0,
+        alignment_threshold=0.7,
+        duplicate_threshold=0.95,
+        failure_penalty=0.5,
+        max_recovery_attempts=2,
+        storage_dtype="fp16",
+    )
+    manager.add_candidate(
+        _item(12, 0.4, 0.6, torch.tensor([1.0, 0.0]))
+    )
+    manager.add_candidate(
+        _item(13, 1.0, 0.9, torch.tensor([0.0, 1.0]))
+    )
+
+    stats = manager.refresh(
+        lambda expert_id, item: (
+            (0.0, 1.0)
+            if item.sample_id == 13
+            else (item.last_alignment, 1.0)
+        ),
+        timestamp=20,
+        count_recovery_attempts=False,
+    )
+
+    assert stats["stable_to_recovery"] == 1
+    assert stats["recovery_evicted"] == 1
+    assert stats["recovery_attempt_exhausted"] == 0
+    assert stats["recovery_failed"] == 0
+    assert stats["evicted"] == 1
+    assert not manager.recovery_buffers[0].contains(12)
+    assert manager.recovery_buffers[0].contains(13)
+    assert not manager.stable_buffers[0].contains(13)
+    assert [item.sample_id for item in manager.all_items()].count(13) == 1
+
+
 def test_duplicate_keeps_higher_stable_score() -> None:
     buffer = FixedCapacityExpertBuffer(
         capacity=3,

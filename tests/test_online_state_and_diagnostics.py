@@ -79,7 +79,12 @@ def test_credit_diagnostics_are_bounded_and_persisted(tmp_path) -> None:
     assert arrays["current_responsibility"].shape == (2, 2)
     assert arrays["prediction_expert_mse"].shape == (2, 2)
     assert arrays["current_expert_mse"].shape == (2, 2)
+    assert arrays["capability_alignment_existing"].shape == (2, 2)
     assert arrays["capability_alignment"].shape == (2, 2)
+    assert np.array_equal(
+        arrays["capability_alignment_existing"],
+        arrays["capability_alignment"],
+    )
     assert arrays["capability_l2_distance"].shape == (2, 2)
     assert arrays["expert_update_delta"].tolist() == [1, 2]
     with open(summary_path, "r", encoding="utf-8") as handle:
@@ -231,6 +236,10 @@ def test_completed_record_diagnostic_uses_prediction_snapshot_and_version_delta(
 
     diagnostic = experiment.credit_diagnostics[-1]
     assert diagnostic["expert_update_delta"] == 7
+    assert diagnostic["capability_alignment_existing"] == [1.0, 1.0]
+    assert diagnostic["capability_alignment_existing"] == diagnostic[
+        "capability_alignment"
+    ]
     assert diagnostic["prediction_expert_mse"] == [0.0, 4.0]
     assert diagnostic["current_expert_mse"] == [1.0, 9.0]
     assert diagnostic["prediction_mixture_mse"] == 2.25
@@ -250,6 +259,7 @@ def test_completed_record_diagnostic_uses_prediction_snapshot_and_version_delta(
     assert arrays["current_responsibility"].shape == (1, 2)
     assert arrays["prediction_expert_mse"].shape == (1, 2)
     assert arrays["current_expert_mse"].shape == (1, 2)
+    assert arrays["capability_alignment_existing"].shape == (1, 2)
     assert arrays["capability_alignment"].shape == (1, 2)
     assert arrays["capability_l2_distance"].shape == (1, 2)
     assert arrays["expert_update_delta"].tolist() == [7]
@@ -275,6 +285,7 @@ def test_empty_credit_diagnostics_keep_two_dimensional_expert_fields(tmp_path) -
     arrays = np.load(tmp_path / "credit_diagnostics.npz")
     assert arrays["prediction_responsibility"].shape == (0, 2)
     assert arrays["current_expert_mse"].shape == (0, 2)
+    assert arrays["capability_alignment_existing"].shape == (0, 2)
     assert arrays["capability_alignment"].shape == (0, 2)
     assert arrays["oracle_top2_pair"].shape == (0, 2)
     specialization = np.load(tmp_path / "specialization_diagnostics.npz")

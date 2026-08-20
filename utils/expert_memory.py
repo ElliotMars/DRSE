@@ -97,6 +97,15 @@ class VersionedMemoryItem:
         )
 
 
+@dataclass(frozen=True)
+class BufferAddResult:
+    """Detailed outcome of one fixed-capacity buffer insertion."""
+
+    accepted: bool
+    replaced_item: Optional[VersionedMemoryItem]
+    reason: str
+
+
 class FixedCapacityExpertBuffer:
     def __init__(
         self,
@@ -120,9 +129,11 @@ class FixedCapacityExpertBuffer:
             return item.stable_score
         return item.recovery_score(self.failure_penalty)
 
-    def add(self, item: VersionedMemoryItem) -> bool:
+    def add_with_result(self, item: VersionedMemoryItem) -> BufferAddResult:
+        """Insert an item and report whether an existing item was replaced."""
+
         if self.capacity == 0:
-            return False
+            return BufferAddResult(False, None, "rejected")
 
         same_sample = next(
             (i for i, old in enumerate(self._items) if old.sample_id == item.sample_id),
@@ -130,9 +141,10 @@ class FixedCapacityExpertBuffer:
         )
         if same_sample is not None:
             if self._score(item) > self._score(self._items[same_sample]):
+                replaced = self._items[same_sample]
                 self._items[same_sample] = item
-                return True
-            return False
+                return BufferAddResult(True, replaced, "duplicate_replaced")
+            return BufferAddResult(False, None, "duplicate_rejected")
 
         if self.kind == "stable" and self._items:
             query = item.normalized_sketch.float()
@@ -147,20 +159,27 @@ class FixedCapacityExpertBuffer:
             duplicate_index = int(similarities.argmax().item())
             if float(similarities[duplicate_index].item()) > self.duplicate_threshold:
                 if self._score(item) > self._score(self._items[duplicate_index]):
+                    replaced = self._items[duplicate_index]
                     self._items[duplicate_index] = item
-                    return True
-                return False
+                    return BufferAddResult(True, replaced, "duplicate_replaced")
+                return BufferAddResult(False, None, "duplicate_rejected")
 
         if len(self._items) < self.capacity:
             self._items.append(item)
-            return True
+            return BufferAddResult(True, None, "inserted")
         lowest_index = min(
             range(len(self._items)), key=lambda index: self._score(self._items[index])
         )
         if self._score(item) > self._score(self._items[lowest_index]):
+            replaced = self._items[lowest_index]
             self._items[lowest_index] = item
-            return True
-        return False
+            return BufferAddResult(True, replaced, "replaced")
+        return BufferAddResult(False, None, "rejected")
+
+    def add(self, item: VersionedMemoryItem) -> bool:
+        """Backward-compatible boolean insertion API."""
+
+        return self.add_with_result(item).accepted
 
     def remove(self, sample_id: int) -> Optional[VersionedMemoryItem]:
         for index, item in enumerate(self._items):
@@ -227,12 +246,16 @@ class ExpertMemoryManager:
             for _ in range(num_experts)
         ]
 
-    def add_candidate(self, item: VersionedMemoryItem) -> Optional[MemoryKind]:
+    def add_candidate_with_result(
+        self, item: VersionedMemoryItem
+    ) -> tuple[Optional[MemoryKind], BufferAddResult]:
+        """Admit a candidate while preserving the buffer insertion outcome."""
+
         expert_id = int(item.expert_id)
         if not 0 <= expert_id < self.num_experts:
             raise IndexError("invalid expert_id")
         if item.sample_responsibility < self.responsibility_threshold:
-            return None
+            return None, BufferAddResult(False, None, "rejected")
         item.to_cpu_storage(self.storage_dtype)
         kind: MemoryKind = (
             "stable"
@@ -249,10 +272,17 @@ class ExpertMemoryManager:
             if kind == "stable"
             else self.stable_buffers[expert_id]
         )
-        if target.add(item):
+        result = target.add_with_result(item)
+        if result.accepted:
             other.remove(item.sample_id)
-            return kind
-        return None
+            return kind, result
+        return None, result
+
+    def add_candidate(self, item: VersionedMemoryItem) -> Optional[MemoryKind]:
+        """Backward-compatible candidate admission API."""
+
+        kind, _ = self.add_candidate_with_result(item)
+        return kind
 
     def refresh(
         self,
@@ -303,8 +333,12 @@ class ExpertMemoryManager:
             if removed is None:
                 continue
             self.recovery_buffers[expert_id].remove(item.sample_id)
-            if self.recovery_buffers[expert_id].add(removed):
+            result = self.recovery_buffers[expert_id].add_with_result(removed)
+            if result.accepted:
                 stats["stable_to_recovery"] += 1
+                if result.reason == "replaced":
+                    stats["recovery_evicted"] += 1
+                    stats["evicted"] += 1
             else:
                 stats["evicted"] += 1
 

@@ -216,6 +216,53 @@ def test_evidence_mass_scale_must_be_positive_and_finite() -> None:
             raise AssertionError("invalid evidence mass scale must fail")
 
 
+def test_empty_stable_refresh_deactivates_cached_basis_protection() -> None:
+    protector = _protector(
+        rank=1,
+        min_samples=1,
+        subspace_lambda=100.0,
+        evidence_mass_scale=1.0,
+    )
+    features = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]
+    )
+    assert protector.refresh_expert(
+        0,
+        features,
+        torch.ones(2),
+        sample_count=2,
+        step=1,
+        stable_evidence_mass=2.0,
+    )
+    state = protector.states[0]
+    cached_basis = state.basis.clone()
+    assert state.protection_mass > 0.0
+    assert protector.gamma(0, current_lr=0.01) < 1.0
+
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.memory_manager = SimpleNamespace(
+        stable_buffers=[SimpleNamespace(items=())]
+    )
+    experiment.subspace_protector = protector
+    experiment.diagnostics = SimpleNamespace(update=lambda **kwargs: None)
+    experiment._refresh_subspaces(step=2)
+
+    assert state.stable_evidence_mass == 0.0
+    assert state.protection_mass == 0.0
+    assert state.gamma == 1.0
+    assert state.last_refresh_step == 2
+    assert state.effective_rank == 1
+    assert torch.equal(state.basis, cached_basis)
+
+    gradient = torch.randn(3, 4)
+    filtered, stats = protector.filter_gradient(
+        0, gradient, current_lr=0.01
+    )
+    assert torch.equal(filtered, gradient)
+    assert stats.gamma == 1.0
+    assert stats.rank == 1
+
+
 class _HeadFeatureExpert(nn.Module):
     def forward(self, x):
         return x

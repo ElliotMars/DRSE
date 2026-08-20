@@ -285,6 +285,28 @@ bash scripts/run_progressive_credit_subspace.sh
 
 `MAX_ONLINE_STEPS=-1` 表示不限制；严格检查只建议在短程 smoke test 中开启。
 
+### Recommended Full DRSE / Full Method Configuration
+
+CLI global defaults 为了兼容旧实验仍是 `progressive_fb=false`、
+`router_granularity=channel` 和 `expert_update_strategy=tsb`；它们不等于
+论文 Full Method 配置。推荐直接使用
+`scripts/run_progressive_credit_subspace.sh`，该脚本显式启用 progressive
+feedback、`horizon_channel` Router 和 `subspace` Expert 更新。正式配置的
+关键参数如下：
+
+| 组件 | Full Method 配置 |
+|---|---|
+| Progressive / Router | `--progressive_fb --router_granularity horizon_channel` |
+| Expert | `--expert_update_strategy subspace --expert_composition mixed --num_experts 4 --top_k 4` |
+| Online correction | 默认启用；`--correction_lr 0.1 --correction_decay 0.01` |
+| Capability / credit | `--capability_sketch_dim 32 --capability_sketch_seed 2025 --responsibility_threshold 0.3 --alignment_threshold 0.8 --credit_top_k 1` |
+| Stable / Recovery | `--stable_buffer_size 32 --recovery_buffer_size 32 --memory_refresh_interval 100 --recovery_batch_size 2 --recovery_loss_weight 0.1 --recovery_sketch_weight 1.0` |
+| Recovery lifecycle | `--recovery_failure_penalty 0.5 --max_recovery_attempts 3 --promote_alignment_threshold 0.9 --promote_loss_threshold 1.0` |
+| Subspace | `--subspace_rank 16 --subspace_max_rank 32 --subspace_energy_threshold 0.95 --subspace_refresh_interval 100 --subspace_min_samples 4 --subspace_lambda 1e4 --subspace_evidence_mass_scale 8.0 --subspace_gamma_min 0 --subspace_gamma_max 1` |
+
+脚本参数可通过前文列出的同名环境变量覆盖。修改 Full Method 配置时应显式记录
+覆盖项，不要把 CLI global defaults 当作论文配置。
+
 消融实验通过参数组合完成，无需复制实现：
 
 | 消融 | 关键参数（其余沿用新脚本默认值） |
@@ -294,9 +316,9 @@ bash scripts/run_progressive_credit_subspace.sh
 | Progressive correction，无 version awareness | `--disable_version_awareness` |
 | Single Stable，无 Recovery | `--disable_recovery` |
 | Stable + Recovery，无 subspace | `--expert_update_strategy plain` |
-| 普通 per-Expert subspace | `--disable_credit_weighted_subspace --expert_update_strategy subspace` |
-| Responsibility-conditioned subspace | `--disable_version_awareness --expert_update_strategy subspace` |
-| Version-aware responsibility-conditioned subspace | `--expert_update_strategy subspace` |
+| Unweighted Stable Subspace（仅 covariance 等权） | `--disable_credit_weighted_subspace --expert_update_strategy subspace` |
+| Credit-weighted Stable Subspace（无 version awareness） | `--disable_version_awareness --expert_update_strategy subspace` |
+| Version-aware Credit-weighted Stable Subspace | `--expert_update_strategy subspace` |
 | TSB | `--expert_update_strategy tsb` |
 | Subspace | `--expert_update_strategy subspace` |
 | Hybrid | `--expert_update_strategy hybrid` |
@@ -377,7 +399,7 @@ python -u main.py \
 | `--disable_online_correction` | false | progressive 协议保留但禁用 `z` |
 | `--disable_version_awareness` | false | alignment 在 credit/memory 中视为 1 |
 | `--disable_recovery` | false | 只使用 Stable buffer，不做 replay |
-| `--disable_credit_weighted_subspace` | false | subspace 样本等权 |
+| `--disable_credit_weighted_subspace` | false | 仅让 Stable-subspace covariance 的样本权重等权；memory admission、生命周期和 evidence-adaptive gamma 保持启用 |
 | `--disable_expert_online_update` | false | 冻结在线 Expert，仅更新 Neural Router |
 | `--disable_tsb` | false | 完整关闭 TSB smoothing、conflict filter 与 reference |
 | `--disable_tsb_smoothing` | false | 单独关闭 TSB gradient smoothing |
@@ -399,6 +421,15 @@ Router 始终先产生所有 Expert 均为正且归一化的 dense prior。Progr
 
 周期重评时，alignment 下降的 Stable 样本会先从 Stable 删除，再尝试迁往 Recovery；若 Recovery 已满且拒绝该样本，样本直接淘汰，不会错误地留在 Stable。每次完整 Expert 更新会使用同一个排除集合从所有 Recovery buffer 无重复采样，因此相同 sample ID 在一个 online step 最多 replay 一次；历史 prediction-time sketch 强制 stop-gradient，当前 Expert 分支保留梯度。更新后重新计算 loss/alignment：尚未恢复的样本留在 Recovery；恢复成功且 Stable 接收时迁入 Stable；恢复成功但 Stable 拒绝时直接淘汰，不会再次 replay；第 `max_recovery_attempts` 次 replay 失败后即淘汰。周期 refresh 使用完全相同的 Stable-or-Discard 语义。所有 replay、memory 和 subspace 额外 forward 都禁用 FSNet 持久状态写入。
 
+当前 capability sketch 是 pooled representation snapshot 的固定随机投影：
+ExpertNet 使用 temporal-mean representation，FSNet-Time 使用 channel-mean
+representation。record-level `capability_alignment_existing` 明确表示这一
+现有 coarse sketch 的 alignment；`capability_alignment` 作为向后兼容别名
+保留。它不是完整 prediction-head capability，也不应解释为 exact head-feature
+alignment。当前 record 没有保存 prediction-time head feature；后续若增加
+`head_feature_alignment`，应作为 evaluation-only 诊断单独设计存储开销，
+不能改变 admission、Recovery loss 或 subspace。
+
 ### 重复在线测试状态恢复
 
 同一个 `Exp` 第一次调用 `test()` 时，会在任何在线更新前捕获预训练后的 model state、FSNet 注册状态、Expert/Router optimizer state 和参数 `requires_grad`。后续调用 `test()` 会先恢复该 CPU 快照，再清除 gradient、Router correction、TSB buffer、Stable/Recovery memory、subspace、diagnostics 和临时计数。`grads`、`f_grads`、`q_ema`、`trigger` 已注册为 buffer，`W` 属于 model parameter，因此均包含在 `state_dict()` 中。当前不恢复 RNG state；Recovery 采样是确定性优先级排序，重复流测试使用固定输入和 seed。
@@ -407,7 +438,7 @@ Router 始终先产生所有 Expert 均为正且归一化的 dense prior。Progr
 
 `plain` 使用原始梯度；`tsb` 默认保留原有参考梯度平滑和冲突投影；`subspace` 不计算 TSB reference，只过滤 prediction-head weight；`hybrid` 先执行启用的 TSB 子步骤，再执行 prediction-head subspace filtering。TSB smoothing 先构造 `(1-alpha) × current + alpha × reference`，关闭 smoothing 时直接使用 current；conflict filter 只在开启且存在 reference 时投影掉负点积方向。两者都关闭时不计算 reference，结果等于 raw current gradient。`--disable_tsb` 保留兼容：与 `tsb` 冲突时降为 `plain`，与 `hybrid` 冲突时降为 `subspace`，启动时会打印 warning。区间 diagnostics 保存 `tsb_smoothing_enabled`、`tsb_conflict_filter_enabled` 与 `tsb_conflict_rate`。
 
-Subspace 使用 Stable head features 构建非中心化加权二阶矩 `M = Hᵀ diag(w) H / sum(w)`，对称化后调用 `torch.linalg.eigh`。不做均值中心化，因此重复出现的同一 prediction-head activation 方向仍会被保护。实现只构建 `[320,320]` 矩阵，不会构建 `[B*C,B*C]` 矩阵；负权重会显式报错，非有限或证据不足的刷新会保留旧 basis。Subspace 的样本权重直接使用 memory 中的 `item.stable_credit`；FSNet-Time 的 channel feature 都作为观测，但同一样本的 stable credit 平均分配给所有 channel，因此 channel 权重和仍等于该样本的 stable credit。Stable evidence mass 是当前 Stable 样本 `stable_credit` 的累积和 `m = Σq_stable`，保护质量使用 `m / (m + subspace_evidence_mass_scale)` 饱和归一化；随后 `lambda_eff = subspace_lambda × protection_mass`，`gamma = 1 / (1 + online_lr × lambda_eff)`。无 Stable evidence 时 protection mass 为 0、gamma 为 1。其主要额外开销是周期性 read-only feature forward、每个 Expert 一个 320 维特征协方差和至多 `subspace_max_rank` 个 basis 向量；当前不保护 encoder 层。
+Subspace 使用 Stable head features 构建非中心化加权二阶矩 `M = Hᵀ diag(w) H / sum(w)`，对称化后调用 `torch.linalg.eigh`。不做均值中心化，因此重复出现的同一 prediction-head activation 方向仍会被保护。实现只构建 `[320,320]` 矩阵，不会构建 `[B*C,B*C]` 矩阵；负权重会显式报错，非有限或非空但证据不足的刷新会保留旧 basis。Subspace 的样本权重直接使用 memory 中的 `item.stable_credit`；FSNet-Time 的 channel feature 都作为观测，但同一样本的 stable credit 平均分配给所有 channel，因此 channel 权重和仍等于该样本的 stable credit。Stable evidence mass 是当前 Stable 样本 `stable_credit` 的累积和 `m = Σq_stable`，保护质量使用 `m / (m + subspace_evidence_mass_scale)` 饱和归一化；随后 `lambda_eff = subspace_lambda × protection_mass`，`gamma = 1 / (1 + online_lr × lambda_eff)`。Stable buffer 变空时保留 cached basis geometry，但立即把 evidence mass 和 protection mass 置 0、gamma 置 1，因此 filtered gradient 与 raw gradient 相同。其主要额外开销是周期性 read-only feature forward、每个 Expert 一个 320 维特征协方差和至多 `subspace_max_rank` 个 basis 向量；当前只保护 `ExpertNet.regressor` 与 `FSNetTimeExpertNet.regressor_time`，不保护 encoder 层。
 
 ECL 在 `seq_len=60`、`pred_len=48`、321 通道、sketch 维数 32 时，每个 memory item 约保存 35,152 个浮点值：FP16 约 68.7 KiB。默认每个 Expert 32 个 Stable 加 32 个 Recovery、4 个 Expert 全部满载的上界约为 17.2 MiB；FP32 约为 34.3 MiB。Python 对象和少量标量开销未计入，`credit_top_k=1` 会限制单个 record 的复制数量。
 
@@ -468,7 +499,7 @@ iteration 的 summary JSON 汇总，不加载逐步 NPZ。随机种子为
 
 Progressive Multi-Expert 诊断按 `online_log_interval` 聚合，包含 MSE、prior/effective entropy、`z` norm、Expert 权重与独立 MSE、责任与版本漂移、buffer 生命周期、Recovery 成功率、subspace rank/energy/drift、平行/正交梯度、gamma、TSB conflict rate 和 Router Gap。控制台只保留稀疏摘要。区间数组写入 `online_diagnostics.npz`。
 
-Bounded `credit_diagnostics.npz` 为每个完整 record 保存 origin、prediction/current responsibility `[E]`、prediction/current Expert MSE `[E]`、capability alignment 与 L2 distance `[E]`、JS divergence、ranking reversal、sample confidence、horizon delay、等待期间的 `expert_update_delta`、prediction-time mixture MSE 和 Router Gap；空结果仍输出 `[0,E]` Expert 字段以及 `[0,2]` top-2 pair。它还使用 prediction-time 已保存的 Expert/mixture prediction 与完整 matured target 计算 evaluation-only Hard Expert oracle 和 Top-2 convex oracle，保存 `oracle_hard_expert_id`、`oracle_hard_mse`、`oracle_top2_mse`、`oracle_top2_pair [2]`、`oracle_top2_alpha`、`router_mse`、`gap_to_hard_oracle` 与 `gap_to_top2_oracle`。这些 per-sample oracle 只用于机制诊断，不是 no-regret comparator，也不会进入 Router、Expert、`z`、memory 或 subspace 更新。summary 同时报告累计 record 数、实际保留数与估算覆盖数。
+Bounded `credit_diagnostics.npz` 为每个完整 record 保存 origin、prediction/current responsibility `[E]`、prediction/current Expert MSE `[E]`、pooled-sketch `capability_alignment_existing [E]`（`capability_alignment` 为兼容别名）与 L2 distance `[E]`、JS divergence、ranking reversal、sample confidence、horizon delay、等待期间的 `expert_update_delta`、prediction-time mixture MSE 和 Router Gap；空结果仍输出 `[0,E]` Expert 字段以及 `[0,2]` top-2 pair。它还使用 prediction-time 已保存的 Expert/mixture prediction 与完整 matured target 计算 evaluation-only Hard Expert oracle 和 Top-2 convex oracle，保存 `oracle_hard_expert_id`、`oracle_hard_mse`、`oracle_top2_mse`、`oracle_top2_pair [2]`、`oracle_top2_alpha`、`router_mse`、`gap_to_hard_oracle` 与 `gap_to_top2_oracle`。这些 per-sample oracle 只用于机制诊断，不是 no-regret comparator，也不会进入 Router、Expert、`z`、memory 或 subspace 更新。summary 同时报告累计 record 数、实际保留数与估算覆盖数。
 
 `specialization_diagnostics.npz` 使用 streaming sum/count，状态空间为 `O((H+C)E)`，不会保存逐 record 的 `H×C×E` tensor。字段为 `mean_router_weight_by_horizon [H,E]`、`mean_router_weight_by_channel [C,E]`、`expert_mse_by_horizon [H,E]`、`expert_mse_by_channel [C,E]`，以及 winning Expert rate 的同形状数组。evaluation target 只在 `_update_prediction_diagnostics()` 中更新这些统计，不参与任何训练操作。
 

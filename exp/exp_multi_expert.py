@@ -1721,6 +1721,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if expert_update_delta < 0:
             raise RuntimeError("Expert update counter moved backwards")
         current_expert_mse = current_squared_error.mean(dim=(0, 1))
+        alignment_values = alignment.detach().cpu().tolist()
         diagnostic = {
             "origin": record.origin,
             "prediction_responsibility": (
@@ -1735,7 +1736,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "current_expert_mse": current_expert_mse.detach().cpu().tolist(),
             "js_divergence": float(js_divergence.item()),
             "ranking_reversal": ranking_reversal,
-            "capability_alignment": alignment.detach().cpu().tolist(),
+            "capability_alignment_existing": alignment_values,
+            "capability_alignment": alignment_values,
             "capability_l2_distance": sketch_l2.detach().cpu().tolist(),
             "sample_confidence": sample_confidence,
             "horizon_delay": int(current_origin - record.origin),
@@ -1766,6 +1768,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
             sample_confidence=sample_confidence,
             responsibility_js_divergence=float(js_divergence.item()),
             ranking_reversal=float(ranking_reversal),
+            capability_alignment_existing=alignment.detach().cpu().numpy(),
             capability_alignment=alignment.detach().cpu().numpy(),
             router_gap=router_gap,
         )
@@ -1840,8 +1843,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
     def _commit_memory_candidates(
         self, candidates: List[VersionedMemoryItem]
     ) -> None:
+        recovery_capacity_evictions = 0
         for item in candidates:
-            self.memory_manager.add_candidate(item)
+            kind, result = self.memory_manager.add_candidate_with_result(item)
+            if kind == "recovery" and result.reason == "replaced":
+                recovery_capacity_evictions += 1
+        if recovery_capacity_evictions:
+            self.diagnostics.increment(
+                recovery_evicted=recovery_capacity_evictions,
+                drop_count=recovery_capacity_evictions,
+            )
         self._update_memory_diagnostics()
 
     def _transport_credit_to_memory(
@@ -1926,6 +1937,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
         for expert_id, buffer in enumerate(self.memory_manager.stable_buffers):
             items = buffer.items
             if not items:
+                self.subspace_protector.deactivate_protection(
+                    expert_id, step=step
+                )
                 continue
             x = torch.cat([item.x for item in items], dim=0).float().to(self.device)
             x_mark = (
@@ -2354,10 +2368,22 @@ class Exp_TS2VecSupervised(Exp_Basic):
             else int(getattr(getattr(self, "model", None), "num_experts", 0))
         )
 
-        def expert_field(name: str) -> np.ndarray:
+        def expert_field(
+            name: str, fallback: str | None = None
+        ) -> np.ndarray:
             if not records:
                 return np.empty((0, num_experts), dtype=np.float64)
-            values = np.asarray([record[name] for record in records], dtype=np.float64)
+            def value(record: dict[str, Any]):
+                if name in record:
+                    return record[name]
+                if fallback is not None:
+                    return record[fallback]
+                raise KeyError(name)
+
+            values = np.asarray(
+                [value(record) for record in records],
+                dtype=np.float64,
+            )
             expected = (len(records), num_experts)
             if values.shape != expected:
                 raise ValueError(
@@ -2374,6 +2400,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "current_responsibility": expert_field("current_responsibility"),
             "prediction_expert_mse": expert_field("prediction_expert_mse"),
             "current_expert_mse": expert_field("current_expert_mse"),
+            "capability_alignment_existing": expert_field(
+                "capability_alignment_existing", "capability_alignment"
+            ),
             "capability_alignment": expert_field("capability_alignment"),
             "capability_l2_distance": expert_field(
                 "capability_l2_distance"
