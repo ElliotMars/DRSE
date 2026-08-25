@@ -560,16 +560,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.recovery_enabled = not bool(
             getattr(args, "disable_recovery", False)
         )
-        self.directional_recovery_enabled = (
+        self.direction_awareness_enabled = (
             self.version_awareness_enabled
-            and self.recovery_enabled
             and not bool(
                 getattr(args, "disable_directional_recovery", False)
             )
         )
-        self.capability_rebase_enabled = (
-            self.directional_recovery_enabled
-        )
+        # Backward-compatible diagnostics/config name. This gate represents
+        # direction awareness and is intentionally independent of Recovery.
+        self.directional_recovery_enabled = self.direction_awareness_enabled
+        self.capability_rebase_enabled = self.direction_awareness_enabled
         self.expert_online_update_enabled = not bool(
             getattr(args, "disable_expert_online_update", False)
         )
@@ -670,6 +670,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
             recovery_degradation_margin=self.recovery_degradation_margin,
             degradation_eps=self.min_credit_eps,
             capability_rebase_enabled=self.capability_rebase_enabled,
+            recovery_enabled=self.recovery_enabled,
         )
         self.subspace_scope = str(getattr(args, "subspace_scope", "regressor"))
         if self.subspace_scope != "regressor":
@@ -2054,8 +2055,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
             responsibility, k=self.credit_top_k
         ).indices.tolist()
         candidates: List[VersionedMemoryItem] = []
-        directional_enabled = bool(
-            getattr(self, "directional_recovery_enabled", False)
+        direction_awareness_enabled = bool(
+            getattr(
+                self,
+                "direction_awareness_enabled",
+                getattr(self, "directional_recovery_enabled", False),
+            )
             and getattr(self, "version_awareness_enabled", True)
         )
         for expert_id in top_k:
@@ -2085,20 +2090,27 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 and effective_alignment < self.alignment_threshold
             )
             recovery_eligible = bool(
-                not directional_enabled
-                or (
-                    low_alignment
-                    and decision.category == "harmful_drift"
+                self.recovery_enabled
+                and (
+                    not direction_awareness_enabled
+                    or (
+                        low_alignment
+                        and decision.category == "harmful_drift"
+                    )
                 )
             )
-            if low_alignment and not self.recovery_enabled:
-                continue
-
             beneficial_rebase = bool(
                 low_alignment
-                and directional_enabled
-                and not recovery_eligible
+                and direction_awareness_enabled
+                and decision.category
+                == "beneficial_or_neutral_evolution"
             )
+            if (
+                low_alignment
+                and not self.recovery_enabled
+                and not beneficial_rebase
+            ):
+                continue
             if beneficial_rebase:
                 diagnostics = getattr(self, "diagnostics", None)
                 if diagnostics is not None:

@@ -121,6 +121,7 @@ def test_metadata_builder_preserves_paper_critical_values() -> None:
     assert config["adaptive_controller"] == "dynamic"
     assert config["effective_expert_update_strategy"] == "hybrid"
     assert config["tsb_enabled"] is True
+    assert config["direction_awareness_enabled"] is True
     assert config["directional_recovery_enabled"] is True
     assert config["recovery_degradation_margin"] == 0.05
     assert config["capability_rebase_enabled"] is True
@@ -141,15 +142,25 @@ def test_metadata_builder_preserves_paper_critical_values() -> None:
     [
         {"disable_directional_recovery": True},
         {"disable_version_awareness": True},
-        {"disable_recovery": True},
     ],
 )
 def test_directional_recovery_metadata_respects_ablations(overrides) -> None:
     config = build_run_config(_args(**overrides))
 
+    assert config["direction_awareness_enabled"] is False
     assert config["directional_recovery_enabled"] is False
     assert config["capability_rebase_enabled"] is False
     assert config["capability_reference_loss_enabled"] is False
+
+
+def test_disable_recovery_metadata_preserves_direction_awareness() -> None:
+    config = build_run_config(_args(disable_recovery=True))
+
+    assert config["recovery_enabled"] is False
+    assert config["direction_awareness_enabled"] is True
+    assert config["directional_recovery_enabled"] is True
+    assert config["capability_rebase_enabled"] is True
+    assert config["capability_reference_loss_enabled"] is True
 
 
 def test_run_config_json_round_trip_preserves_scalar_types(

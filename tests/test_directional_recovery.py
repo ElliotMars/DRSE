@@ -45,7 +45,10 @@ def _builder_experiment(
     experiment.alignment_threshold = 0.8
     experiment.min_credit_eps = 1e-8
     experiment.recovery_degradation_margin = margin
-    experiment.directional_recovery_enabled = directional and version and recovery
+    experiment.direction_awareness_enabled = directional and version
+    experiment.directional_recovery_enabled = (
+        experiment.direction_awareness_enabled
+    )
     experiment.version_awareness_enabled = version
     experiment.recovery_enabled = recovery
     experiment.diagnostics = OnlineDiagnosticsRecorder(1, interval=1)
@@ -58,6 +61,7 @@ def _manager(
     version: bool = True,
     stable_capacity: int = 2,
     margin: float = 0.0,
+    recovery: bool = True,
 ) -> ExpertMemoryManager:
     return ExpertMemoryManager(
         num_experts=1,
@@ -74,6 +78,7 @@ def _manager(
         directional_recovery_enabled=directional,
         version_awareness_enabled=version,
         recovery_degradation_margin=margin,
+        recovery_enabled=recovery,
     )
 
 
@@ -386,6 +391,13 @@ def test_direction_diagnostics_are_read_only_even_when_recovery_disabled() -> No
     assert diagnostic["prediction_expert_mse"] == [0.0]
     assert diagnostic["current_expert_mse"] == [1.0]
     assert experiment.diagnostics.counters["harmful_drift_count"] == 1.0
+    for counter in (
+        "recovery_attempts",
+        "recovery_successes",
+        "recovery_failed",
+        "recovery_to_stable",
+    ):
+        assert experiment.diagnostics.counters.get(counter, 0.0) == 0.0
     assert experiment._build_memory_candidates(
         record,
         alignment,
@@ -569,6 +581,117 @@ def test_beneficial_new_candidate_uses_rebased_stable_reference() -> None:
     assert experiment.diagnostics.counters[
         "capability_rebase_count"
     ] == 1.0
+
+
+def test_disable_recovery_refreshes_beneficial_stable_reference() -> None:
+    manager = _manager(recovery=False)
+    item = _memory_item(20, alignment=0.9, prediction_loss=1.0)
+    assert manager.add_candidate(item) == "stable"
+    current_sketch = torch.tensor([0.0, 1.0], requires_grad=True)
+
+    stats = manager.refresh(
+        lambda expert_id, stored: (0.2, 0.5, current_sketch),
+        timestamp=21,
+        count_recovery_attempts=True,
+    )
+
+    stored = manager.stable_buffers[0].get(20)
+    assert stored is not None
+    assert stored.capability_evolution == (
+        "beneficial_or_neutral_evolution"
+    )
+    assert stored.reference_capability_loss == pytest.approx(0.5)
+    assert stored.prediction_time_loss == pytest.approx(1.0)
+    assert torch.equal(
+        stored.prediction_capability_sketch,
+        torch.tensor([0.0, 1.0]),
+    )
+    assert not stored.prediction_capability_sketch.requires_grad
+    assert stored.recovery_attempts == 0
+    assert stats["beneficial_evolution"] == 1
+    assert stats["capability_rebase"] == 1
+    assert stats["stable_to_recovery"] == 0
+    assert stats["recovery_to_stable"] == 0
+    assert stats["recovery_failed"] == 0
+    assert manager.sample_recovery(0, batch_size=1) == ()
+
+
+def test_disable_recovery_admits_beneficial_new_stable_candidate() -> None:
+    experiment = _builder_experiment(recovery=False)
+    experiment.memory_manager = _manager(recovery=False)
+    record = _record()
+
+    candidates = experiment._build_memory_candidates(
+        record,
+        alignment=torch.tensor([0.2]),
+        prediction_loss=torch.tensor([1.0]),
+        current_loss=torch.tensor([0.5]),
+        current_sketch=torch.tensor([[0.0, 1.0]], requires_grad=True),
+        timestamp=8,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].capability_evolution == (
+        "beneficial_or_neutral_evolution"
+    )
+    assert candidates[0].reference_capability_loss == pytest.approx(0.5)
+    assert candidates[0].prediction_time_loss == pytest.approx(1.0)
+    experiment._commit_memory_candidates(candidates)
+    assert experiment.memory_manager.stable_buffers[0].contains(7)
+    assert not experiment.memory_manager.recovery_buffers[0].contains(7)
+
+
+def test_disable_recovery_keeps_harmful_stable_without_rebase() -> None:
+    manager = _manager(recovery=False)
+    item = _memory_item(21, alignment=0.9, prediction_loss=1.0)
+    assert manager.add_candidate(item) == "stable"
+    original_sketch = item.prediction_capability_sketch.clone()
+
+    stats = manager.refresh(
+        lambda expert_id, stored: (
+            0.2,
+            1.2,
+            torch.tensor([0.0, 1.0]),
+        ),
+        timestamp=22,
+        count_recovery_attempts=True,
+    )
+
+    stored = manager.stable_buffers[0].get(21)
+    assert stored is not None
+    assert stored.capability_evolution == "harmful_drift"
+    assert stored.reference_capability_loss == pytest.approx(1.0)
+    assert torch.equal(stored.prediction_capability_sketch, original_sketch)
+    assert stored.recovery_attempts == 0
+    assert stats["harmful_drift"] == 1
+    assert stats["capability_rebase"] == 0
+    assert stats["stable_to_recovery"] == 0
+    assert stats["recovery_to_stable"] == 0
+    assert stats["recovery_failed"] == 0
+    assert not manager.recovery_buffers[0].contains(21)
+
+
+def test_disable_recovery_rejects_harmful_new_candidate() -> None:
+    experiment = _builder_experiment(recovery=False)
+    record = _record()
+    decision = classify_capability_evolution(
+        alignment=0.2,
+        prediction_loss=1.0,
+        current_loss=1.2,
+        alignment_threshold=0.8,
+    )
+
+    candidates = experiment._build_memory_candidates(
+        record,
+        alignment=torch.tensor([0.2]),
+        prediction_loss=torch.tensor([1.0]),
+        current_loss=torch.tensor([1.2]),
+        current_sketch=torch.tensor([[0.0, 1.0]]),
+        timestamp=8,
+    )
+
+    assert decision.category == "harmful_drift"
+    assert candidates == []
 
 
 def test_alignment_only_ablation_ignores_reference_loss_gate() -> None:

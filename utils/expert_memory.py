@@ -337,6 +337,7 @@ class ExpertMemoryManager:
         recovery_degradation_margin: float = 0.0,
         degradation_eps: float = 1e-8,
         capability_rebase_enabled: bool = True,
+        recovery_enabled: bool = True,
     ) -> None:
         if num_experts <= 0:
             raise ValueError("num_experts must be positive")
@@ -350,10 +351,13 @@ class ExpertMemoryManager:
         self.promote_alignment_threshold = float(promote_alignment_threshold)
         self.promote_loss_threshold = float(promote_loss_threshold)
         self.version_awareness_enabled = bool(version_awareness_enabled)
-        self.directional_recovery_enabled = bool(
+        self.direction_awareness_enabled = bool(
             directional_recovery_enabled
             and self.version_awareness_enabled
         )
+        # Backward-compatible name for existing diagnostics and callers.
+        self.directional_recovery_enabled = self.direction_awareness_enabled
+        self.recovery_enabled = bool(recovery_enabled)
         self.recovery_degradation_margin = float(
             recovery_degradation_margin
         )
@@ -397,19 +401,23 @@ class ExpertMemoryManager:
             if item.last_alignment >= self.alignment_threshold
             else "recovery"
         )
-        if self.directional_recovery_enabled and kind == "stable":
+        if kind == "recovery" and not self.recovery_enabled:
+            return None, BufferAddResult(
+                False, None, "recovery_disabled"
+            )
+        if self.direction_awareness_enabled and kind == "stable":
             item.recovery_eligible = False
             item.refresh_credit()
         if (
             kind == "recovery"
-            and self.directional_recovery_enabled
+            and self.direction_awareness_enabled
             and not item.recovery_eligible
         ):
             return None, BufferAddResult(
                 False, None, "directional_rejected"
             )
         if (
-            self.directional_recovery_enabled
+            self.direction_awareness_enabled
             and not math.isfinite(item.get_reference_capability_loss())
         ):
             raise ValueError(
@@ -465,7 +473,7 @@ class ExpertMemoryManager:
     ) -> Optional[CapabilityEvolutionDecision]:
         reference_loss = item.get_reference_capability_loss()
         if not math.isfinite(reference_loss):
-            if self.directional_recovery_enabled:
+            if self.direction_awareness_enabled:
                 raise ValueError(
                     "directional Recovery requires finite reference_capability_loss"
                 )
@@ -519,11 +527,15 @@ class ExpertMemoryManager:
             for expert_id, buffer in enumerate(self.stable_buffers)
             for item in buffer.items
         ]
-        recovery_snapshots = [
-            (expert_id, item)
-            for expert_id, buffer in enumerate(self.recovery_buffers)
-            for item in buffer.items
-        ]
+        recovery_snapshots = (
+            [
+                (expert_id, item)
+                for expert_id, buffer in enumerate(self.recovery_buffers)
+                for item in buffer.items
+            ]
+            if self.recovery_enabled
+            else []
+        )
 
         demotions: List[Tuple[int, VersionedMemoryItem]] = []
         for expert_id, item in stable_snapshots:
@@ -552,24 +564,29 @@ class ExpertMemoryManager:
                 self.version_awareness_enabled
                 and effective_alignment < self.alignment_threshold
             )
-            if self.directional_recovery_enabled:
+            if self.direction_awareness_enabled:
                 item.recovery_eligible = bool(
-                    low_alignment
+                    self.recovery_enabled
+                    and low_alignment
                     and decision is not None
                     and decision.category == "harmful_drift"
                 )
             else:
-                item.recovery_eligible = True
+                item.recovery_eligible = self.recovery_enabled
             item.refresh_credit()
             if not low_alignment:
                 continue
             if (
-                self.directional_recovery_enabled
-                and not item.recovery_eligible
+                self.direction_awareness_enabled
+                and decision is not None
+                and decision.category
+                == "beneficial_or_neutral_evolution"
             ):
                 stats["recovery_skipped_non_degraded"] += 1
                 if self._maybe_rebase(item, current_sketch, current_loss):
                     stats["capability_rebase"] += 1
+                continue
+            if not self.recovery_enabled:
                 continue
             demotions.append((expert_id, item))
 
@@ -620,7 +637,7 @@ class ExpertMemoryManager:
                 item.recovery_attempts += 1
 
             performance_recovered = bool(
-                self.directional_recovery_enabled
+                self.direction_awareness_enabled
                 and decision is not None
                 and not decision.degraded
             )
@@ -667,7 +684,7 @@ class ExpertMemoryManager:
 
         if not 0 <= expert_id < self.num_experts:
             raise IndexError("invalid expert_id")
-        if batch_size <= 0:
+        if not self.recovery_enabled or batch_size <= 0:
             return ()
         excluded = excluded_sample_ids if excluded_sample_ids is not None else set()
         buffer = self.recovery_buffers[expert_id]
@@ -696,12 +713,15 @@ class ExpertMemoryManager:
         "dropped",
         "dropped_after_recovery",
         "dropped_after_performance_recovery",
+        "recovery_disabled",
         "missing",
     ]:
         """Apply one post-update Recovery result and lifecycle transition."""
 
         if not 0 <= expert_id < self.num_experts:
             raise IndexError("invalid expert_id")
+        if not self.recovery_enabled:
+            return "recovery_disabled"
         buffer = self.recovery_buffers[expert_id]
         item = buffer.get(sample_id)
         if item is None:
@@ -725,7 +745,7 @@ class ExpertMemoryManager:
         if decision is not None:
             item.capability_evolution = decision.category
         performance_recovered = bool(
-            self.directional_recovery_enabled
+            self.direction_awareness_enabled
             and decision is not None
             and not decision.degraded
         )

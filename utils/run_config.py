@@ -218,11 +218,10 @@ def build_run_config(
     tsb_enabled = (
         online_enabled and effective_strategy in {"tsb", "hybrid"}
     )
-    directional_recovery_enabled = bool(
+    direction_awareness_enabled = bool(
         online_enabled
         and not getattr(args, "disable_directional_recovery", False)
         and not getattr(args, "disable_version_awareness", False)
-        and not getattr(args, "disable_recovery", False)
     )
     config.update(
         {
@@ -241,14 +240,15 @@ def build_run_config(
             "recovery_enabled": online_enabled and not bool(
                 getattr(args, "disable_recovery", False)
             ),
+            "direction_awareness_enabled": direction_awareness_enabled,
             "directional_recovery_enabled": (
-                directional_recovery_enabled
+                direction_awareness_enabled
             ),
             "capability_rebase_enabled": (
-                directional_recovery_enabled
+                direction_awareness_enabled
             ),
             "capability_reference_loss_enabled": (
-                directional_recovery_enabled
+                direction_awareness_enabled
             ),
             "credit_weighted_subspace": not bool(
                 getattr(args, "disable_credit_weighted_subspace", False)
