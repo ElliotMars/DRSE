@@ -57,6 +57,7 @@ def _manager(
     directional: bool = True,
     version: bool = True,
     stable_capacity: int = 2,
+    margin: float = 0.0,
 ) -> ExpertMemoryManager:
     return ExpertMemoryManager(
         num_experts=1,
@@ -72,7 +73,7 @@ def _manager(
         promote_loss_threshold=0.2,
         directional_recovery_enabled=directional,
         version_awareness_enabled=version,
-        recovery_degradation_margin=0.0,
+        recovery_degradation_margin=margin,
     )
 
 
@@ -263,6 +264,8 @@ def test_periodic_refresh_demotes_only_harmful_drift() -> None:
         stored.prediction_capability_sketch,
         torch.tensor([0.0, 1.0]),
     )
+    assert stored.reference_capability_loss == pytest.approx(0.8)
+    assert stored.prediction_time_loss == pytest.approx(1.0)
     assert stored.recovery_credit == 0.0
 
     harmful_manager = _manager()
@@ -312,6 +315,9 @@ def test_performance_recovery_stops_replay_and_rebases_low_alignment_item() -> N
         stored.prediction_capability_sketch,
         torch.tensor([0.0, 1.0]),
     )
+    assert stored.reference_capability_loss == pytest.approx(0.9)
+    assert stored.prediction_time_loss == pytest.approx(1.0)
+
     def evaluate_rebased(expert_id, item):
         del expert_id
         current = torch.tensor([0.0, 1.0])
@@ -389,3 +395,204 @@ def test_direction_diagnostics_are_read_only_even_when_recovery_disabled() -> No
             diagnostic["current_expert_mse"]
         ),
     ) == []
+
+
+def _alignment_to_reference(
+    item: VersionedMemoryItem, current_sketch: torch.Tensor
+) -> float:
+    current = torch.nn.functional.normalize(
+        current_sketch.float(), dim=-1
+    )
+    reference = item.normalized_sketch.float()
+    cosine = torch.dot(reference, current).clamp(-1.0, 1.0)
+    return float(((cosine + 1.0) / 2.0).item())
+
+
+def test_rebased_loss_reference_detects_next_harmful_drift() -> None:
+    manager = _manager()
+    item = _memory_item(10, alignment=0.9, prediction_loss=1.0)
+    assert manager.add_candidate(item) == "stable"
+
+    first_sketch = torch.tensor([0.0, 1.0])
+    first = manager.refresh(
+        lambda expert_id, stored: (
+            _alignment_to_reference(stored, first_sketch),
+            0.5,
+            first_sketch,
+        ),
+        timestamp=11,
+        count_recovery_attempts=False,
+    )
+
+    stored = manager.stable_buffers[0].get(10)
+    assert stored is not None
+    assert first["beneficial_evolution"] == 1
+    assert first["stable_to_recovery"] == 0
+    assert stored.reference_capability_loss == pytest.approx(0.5)
+    assert stored.prediction_time_loss == pytest.approx(1.0)
+
+    second_sketch = torch.tensor([1.0, 0.0])
+    second = manager.refresh(
+        lambda expert_id, stored: (
+            _alignment_to_reference(stored, second_sketch),
+            0.8,
+            second_sketch,
+        ),
+        timestamp=12,
+        count_recovery_attempts=False,
+    )
+
+    recovering = manager.recovery_buffers[0].get(10)
+    assert second["harmful_drift"] == 1
+    assert second["stable_to_recovery"] == 1
+    assert recovering is not None
+    assert recovering.reference_capability_loss == pytest.approx(0.5)
+    assert recovering.prediction_time_loss == pytest.approx(1.0)
+
+
+def test_consecutive_beneficial_rebases_preserve_original_loss() -> None:
+    manager = _manager()
+    item = _memory_item(11, alignment=0.9, prediction_loss=1.0)
+    assert manager.add_candidate(item) == "stable"
+
+    for timestamp, loss, sketch in (
+        (12, 0.7, torch.tensor([0.0, 1.0])),
+        (13, 0.5, torch.tensor([1.0, 0.0])),
+    ):
+        stats = manager.refresh(
+            lambda expert_id, stored, current=sketch, current_loss=loss: (
+                _alignment_to_reference(stored, current),
+                current_loss,
+                current,
+            ),
+            timestamp=timestamp,
+            count_recovery_attempts=False,
+        )
+        stored = manager.stable_buffers[0].get(11)
+        assert stats["beneficial_evolution"] == 1
+        assert stats["stable_to_recovery"] == 0
+        assert stored is not None
+        assert stored.reference_capability_loss == pytest.approx(loss)
+        assert stored.prediction_time_loss == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize(
+    ("current_loss", "expected_kind"),
+    [(0.54, "stable"), (0.56, "recovery")],
+)
+def test_degradation_margin_uses_latest_rebased_loss(
+    current_loss: float, expected_kind: str
+) -> None:
+    manager = _manager(margin=0.1)
+    item = _memory_item(12, alignment=0.9, prediction_loss=1.0)
+    assert manager.add_candidate(item) == "stable"
+
+    first_sketch = torch.tensor([0.0, 1.0])
+    manager.refresh(
+        lambda expert_id, stored: (
+            _alignment_to_reference(stored, first_sketch),
+            0.5,
+            first_sketch,
+        ),
+        timestamp=13,
+        count_recovery_attempts=False,
+    )
+    stored = manager.stable_buffers[0].get(12)
+    assert stored is not None
+    assert stored.reference_capability_loss == pytest.approx(0.5)
+
+    second_sketch = torch.tensor([1.0, 0.0])
+    manager.refresh(
+        lambda expert_id, stored: (
+            _alignment_to_reference(stored, second_sketch),
+            current_loss,
+            second_sketch,
+        ),
+        timestamp=14,
+        count_recovery_attempts=False,
+    )
+
+    if expected_kind == "stable":
+        stored = manager.stable_buffers[0].get(12)
+        assert stored is not None
+        assert stored.reference_capability_loss == pytest.approx(0.54)
+        assert not manager.recovery_buffers[0].contains(12)
+    else:
+        stored = manager.recovery_buffers[0].get(12)
+        assert stored is not None
+        assert stored.reference_capability_loss == pytest.approx(0.5)
+        assert not manager.stable_buffers[0].contains(12)
+    assert stored.prediction_time_loss == pytest.approx(1.0)
+
+
+def test_beneficial_new_candidate_uses_rebased_stable_reference() -> None:
+    experiment = _builder_experiment()
+    experiment.memory_manager = _manager()
+    record = _record()
+    current_sketch = torch.tensor(
+        [[0.0, 1.0]], requires_grad=True
+    )
+
+    candidates = experiment._build_memory_candidates(
+        record,
+        alignment=torch.tensor([0.2]),
+        prediction_loss=torch.tensor([1.0]),
+        current_loss=torch.tensor([0.5]),
+        current_sketch=current_sketch,
+        timestamp=8,
+    )
+
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.capability_evolution == (
+        "beneficial_or_neutral_evolution"
+    )
+    assert candidate.last_alignment == pytest.approx(1.0)
+    assert candidate.last_observed_alignment == pytest.approx(0.2)
+    assert candidate.reference_capability_loss == pytest.approx(0.5)
+    assert candidate.prediction_time_loss == pytest.approx(1.0)
+    assert not candidate.prediction_capability_sketch.requires_grad
+
+    experiment._commit_memory_candidates(candidates)
+    stored = experiment.memory_manager.stable_buffers[0].get(7)
+    assert stored is not None
+    assert not experiment.memory_manager.recovery_buffers[0].contains(7)
+    assert stored.reference_capability_loss == pytest.approx(0.5)
+    assert stored.prediction_time_loss == pytest.approx(1.0)
+    assert torch.equal(
+        stored.prediction_capability_sketch,
+        torch.tensor([0.0, 1.0]),
+    )
+    assert experiment.diagnostics.counters[
+        "recovery_skipped_non_degraded_count"
+    ] == 1.0
+    assert experiment.diagnostics.counters[
+        "capability_rebase_count"
+    ] == 1.0
+
+
+def test_alignment_only_ablation_ignores_reference_loss_gate() -> None:
+    manager = _manager(directional=False)
+    item = _memory_item(13, alignment=0.9, prediction_loss=1.0)
+    item.reference_capability_loss = 0.5
+    assert manager.add_candidate(item) == "stable"
+
+    stats = manager.refresh(
+        lambda expert_id, stored: (
+            0.2,
+            0.4,
+            torch.tensor([0.0, 1.0]),
+        ),
+        timestamp=14,
+        count_recovery_attempts=False,
+    )
+
+    assert stats["stable_to_recovery"] == 1
+    assert manager.recovery_buffers[0].contains(13)
+
+def test_legacy_item_falls_back_to_original_prediction_loss() -> None:
+    item = _memory_item(14, alignment=0.9, prediction_loss=1.0)
+    del item.reference_capability_loss
+
+    assert item.get_reference_capability_loss() == pytest.approx(1.0)
+    assert item.reference_capability_loss == pytest.approx(1.0)

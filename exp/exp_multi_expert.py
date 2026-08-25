@@ -1827,7 +1827,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             eps=self.min_credit_eps,
         )
         if record.capability_sketch is None:
-            raise RuntimeError("completed progressive record has no capability sketch")
+            raise RuntimeError(
+                "completed progressive record has no capability sketch"
+            )
         sketch_pred = record.capability_sketch.float().to(self.device)
         cosine = (sketch_pred * sketch_now).sum(dim=-1).clamp(-1.0, 1.0)
         alignment = ((cosine + 1.0) / 2.0).clamp(0.0, 1.0)
@@ -1884,6 +1886,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         relative_degradation = [
             decision.relative_degradation for decision in decisions
         ]
+        reference_capability_loss = (
+            prediction_expert_mse.detach().cpu().tolist()
+        )
+        original_relative_degradation = list(relative_degradation)
+        reference_relative_degradation = list(relative_degradation)
         degraded_flags = [decision.degraded for decision in decisions]
         harmful_flags = [
             decision.category == "harmful_drift" for decision in decisions
@@ -1908,7 +1915,14 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 prediction_expert_mse.detach().cpu().tolist()
             ),
             "current_expert_mse": current_expert_mse.detach().cpu().tolist(),
+            "reference_capability_loss": reference_capability_loss,
             "relative_capability_degradation": relative_degradation,
+            "original_relative_capability_degradation": (
+                original_relative_degradation
+            ),
+            "reference_relative_capability_degradation": (
+                reference_relative_degradation
+            ),
             "capability_degraded": degraded_flags,
             "capability_evolution": evolution_categories,
             "capability_evolution_code": evolution_codes,
@@ -1969,6 +1983,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
             relative_capability_degradation=np.asarray(
                 relative_degradation, dtype=np.float64
             ),
+            original_relative_capability_degradation=np.asarray(
+                original_relative_degradation, dtype=np.float64
+            ),
+            reference_relative_capability_degradation=np.asarray(
+                reference_relative_degradation, dtype=np.float64
+            ),
+            reference_capability_loss=np.asarray(
+                reference_capability_loss, dtype=np.float64
+            ),
             harmful_drift=np.asarray(harmful_flags, dtype=np.float64),
             beneficial_or_neutral_evolution=np.asarray(
                 beneficial_flags, dtype=np.float64
@@ -1989,6 +2012,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         prediction_loss: torch.Tensor,
         timestamp: int,
         current_loss: Optional[torch.Tensor] = None,
+        current_sketch: Optional[torch.Tensor] = None,
     ) -> List[VersionedMemoryItem]:
         """Classify a completed record without mutating memory yet."""
 
@@ -2005,6 +2029,22 @@ class Exp_TS2VecSupervised(Exp_Basic):
             raise ValueError(
                 "current loss and alignment must have matching Expert shapes"
             )
+        if record.capability_sketch is None:
+            raise RuntimeError("completed progressive record has no capability sketch")
+        if current_sketch is None:
+            current_sketch = getattr(record, "metadata", {}).get(
+                "current_capability_sketch"
+            )
+        if current_sketch is not None:
+            if not isinstance(current_sketch, torch.Tensor):
+                raise TypeError("current capability sketch must be a tensor")
+            if current_sketch.shape != record.capability_sketch.shape:
+                raise ValueError(
+                    "current and prediction capability sketches must have "
+                    "matching shapes"
+                )
+            current_sketch = current_sketch.detach()
+
         sample_confidence = float(record.sample_confidence)
         if not math.isfinite(sample_confidence):
             raise FloatingPointError("sample confidence contains NaN or Inf")
@@ -2023,24 +2063,26 @@ class Exp_TS2VecSupervised(Exp_Basic):
             if expert_responsibility < self.responsibility_threshold:
                 continue
             observed_alignment = float(alignment[expert_id].item())
+            original_loss = float(prediction_loss[expert_id].item())
+            current_expert_loss = float(current_loss[expert_id].item())
             decision = classify_capability_evolution(
                 alignment=observed_alignment,
-                prediction_loss=float(prediction_loss[expert_id].item()),
-                current_loss=float(current_loss[expert_id].item()),
+                prediction_loss=original_loss,
+                current_loss=current_expert_loss,
                 alignment_threshold=self.alignment_threshold,
                 degradation_margin=float(
                     getattr(self, "recovery_degradation_margin", 0.0)
                 ),
                 eps=float(getattr(self, "min_credit_eps", 1e-8)),
             )
-            expert_alignment = (
+            effective_alignment = (
                 observed_alignment
                 if self.version_awareness_enabled
                 else 1.0
             )
             low_alignment = (
                 self.version_awareness_enabled
-                and expert_alignment < self.alignment_threshold
+                and effective_alignment < self.alignment_threshold
             )
             recovery_eligible = bool(
                 not directional_enabled
@@ -2051,17 +2093,28 @@ class Exp_TS2VecSupervised(Exp_Basic):
             )
             if low_alignment and not self.recovery_enabled:
                 continue
-            if (
+
+            beneficial_rebase = bool(
                 low_alignment
                 and directional_enabled
                 and not recovery_eligible
-            ):
+            )
+            if beneficial_rebase:
                 diagnostics = getattr(self, "diagnostics", None)
                 if diagnostics is not None:
                     diagnostics.increment(
                         recovery_skipped_non_degraded_count=1
                     )
-                continue
+                if current_sketch is None:
+                    continue
+                reference_sketch = current_sketch[expert_id]
+                reference_loss = current_expert_loss
+                admission_alignment = 1.0
+            else:
+                reference_sketch = record.capability_sketch[expert_id]
+                reference_loss = original_loss
+                admission_alignment = effective_alignment
+
             candidates.append(
                 VersionedMemoryItem(
                     sample_id=record.origin,
@@ -2070,30 +2123,25 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     x=record.x,
                     x_mark=record.x_mark,
                     target=record.matured_targets.unsqueeze(0),
-                    prediction_capability_sketch=record.capability_sketch[
-                        expert_id
-                    ],
-                    normalized_sketch=record.capability_sketch[expert_id],
+                    prediction_capability_sketch=reference_sketch,
+                    normalized_sketch=reference_sketch,
                     sample_responsibility=expert_responsibility,
                     sample_confidence=sample_confidence,
-                    last_alignment=expert_alignment,
+                    last_alignment=admission_alignment,
                     stable_credit=(
                         sample_confidence
                         * expert_responsibility
-                        * expert_alignment
+                        * admission_alignment
                     ),
                     recovery_credit=(
                         sample_confidence
                         * expert_responsibility
-                        * (1.0 - expert_alignment)
+                        * (1.0 - admission_alignment)
                     ),
                     timestamp=timestamp,
-                    prediction_time_loss=float(
-                        prediction_loss[expert_id].item()
-                    ),
-                    recent_prediction_loss=float(
-                        current_loss[expert_id].item()
-                    ),
+                    prediction_time_loss=original_loss,
+                    reference_capability_loss=reference_loss,
+                    recent_prediction_loss=current_expert_loss,
                     last_observed_alignment=observed_alignment,
                     recovery_eligible=recovery_eligible,
                     capability_evolution=decision.category,
@@ -2106,6 +2154,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
     ) -> None:
         recovery_capacity_evictions = 0
         directional_admissions = 0
+        rebased_stable_admissions = 0
         for item in candidates:
             kind, result = self.memory_manager.add_candidate_with_result(item)
             if (
@@ -2118,11 +2167,26 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 and item.capability_evolution == "harmful_drift"
             ):
                 directional_admissions += 1
+            if (
+                kind == "stable"
+                and getattr(
+                    self.memory_manager,
+                    "directional_recovery_enabled",
+                    False,
+                )
+                and item.capability_evolution
+                == "beneficial_or_neutral_evolution"
+            ):
+                rebased_stable_admissions += 1
             if kind == "recovery" and result.reason == "replaced":
                 recovery_capacity_evictions += 1
         if directional_admissions:
             self.diagnostics.increment(
                 directional_recovery_admission_count=directional_admissions
+            )
+        if rebased_stable_admissions:
+            self.diagnostics.increment(
+                capability_rebase_count=rebased_stable_admissions
             )
         if recovery_capacity_evictions:
             self.diagnostics.increment(
@@ -2404,6 +2468,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 prediction_loss,
                 timestamp=origin,
                 current_loss=current_loss,
+                current_sketch=completed.metadata.get(
+                    "current_capability_sketch"
+                ),
             )
         reconstructed_target = completed.matured_targets.unsqueeze(0)
         # The current sample learns through the old basis first.  Only after
@@ -2772,6 +2839,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 current = np.asarray(
                     record["current_expert_mse"], dtype=np.float64
                 )
+                reference = np.asarray(
+                    record.get(
+                        "reference_capability_loss", prediction
+                    ),
+                    dtype=np.float64,
+                )
                 alignment = np.asarray(
                     record.get(
                         "capability_alignment_existing",
@@ -2779,12 +2852,19 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     ),
                     dtype=np.float64,
                 )
-                relative = (current - prediction) / (prediction + eps)
-                degraded = current > prediction * (1.0 + margin) + eps
+                original_relative = (current - prediction) / (prediction + eps)
+                reference_relative = (current - reference) / (reference + eps)
+                degraded = current > reference * (1.0 + margin) + eps
                 harmful = (alignment < threshold) & degraded
                 beneficial = (alignment < threshold) & ~degraded
                 derived = {
-                    "relative_capability_degradation": relative,
+                    "relative_capability_degradation": original_relative,
+                    "original_relative_capability_degradation": (
+                        original_relative
+                    ),
+                    "reference_relative_capability_degradation": (
+                        reference_relative
+                    ),
                     "capability_degraded": degraded,
                     "harmful_drift": harmful,
                     "beneficial_or_neutral_evolution": beneficial,
@@ -2810,8 +2890,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "current_responsibility": expert_field("current_responsibility"),
             "prediction_expert_mse": expert_field("prediction_expert_mse"),
             "current_expert_mse": expert_field("current_expert_mse"),
+            "reference_capability_loss": expert_field(
+                "reference_capability_loss", "prediction_expert_mse"
+            ),
             "relative_capability_degradation": direction_field(
                 "relative_capability_degradation"
+            ),
+            "original_relative_capability_degradation": direction_field(
+                "original_relative_capability_degradation"
+            ),
+            "reference_relative_capability_degradation": direction_field(
+                "reference_relative_capability_degradation"
             ),
             "capability_evolution_code": direction_field(
                 "capability_evolution_code"
@@ -2936,6 +3025,24 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "mean_relative_capability_degradation": (
                 float(
                     fields["relative_capability_degradation"].mean()
+                )
+                if retained
+                else None
+            ),
+            "mean_original_relative_capability_degradation": (
+                float(
+                    fields[
+                        "original_relative_capability_degradation"
+                    ].mean()
+                )
+                if retained
+                else None
+            ),
+            "mean_reference_relative_capability_degradation": (
+                float(
+                    fields[
+                        "reference_relative_capability_degradation"
+                    ].mean()
                 )
                 if retained
                 else None

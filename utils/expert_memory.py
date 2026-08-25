@@ -89,6 +89,7 @@ class VersionedMemoryItem:
     normalized_sketch: Optional[torch.Tensor] = None
     sample_confidence: float = 1.0
     prediction_time_loss: float = float("inf")
+    reference_capability_loss: Optional[float] = None
     last_observed_alignment: float = 1.0
     recovery_eligible: bool = True
     capability_evolution: CapabilityEvolution = "retained"
@@ -96,6 +97,12 @@ class VersionedMemoryItem:
     def __post_init__(self) -> None:
         self.sample_confidence = float(self.sample_confidence)
         self.prediction_time_loss = float(self.prediction_time_loss)
+        if self.reference_capability_loss is None:
+            self.reference_capability_loss = self.prediction_time_loss
+        else:
+            self.reference_capability_loss = float(
+                self.reference_capability_loss
+            )
         self.last_observed_alignment = float(self.last_observed_alignment)
         self.recovery_eligible = bool(self.recovery_eligible)
         if not math.isfinite(self.sample_confidence):
@@ -103,6 +110,15 @@ class VersionedMemoryItem:
         if not 0.0 <= self.sample_confidence <= 1.0:
             raise ValueError("sample_confidence must be in [0,1]")
         self.refresh_credit()
+
+    def get_reference_capability_loss(self) -> float:
+        """Return the current loss reference, migrating old items lazily."""
+
+        value = getattr(self, "reference_capability_loss", None)
+        if value is None:
+            value = getattr(self, "prediction_time_loss", float("inf"))
+            self.reference_capability_loss = float(value)
+        return float(value)
 
     def refresh_credit(self) -> None:
         """Recompute confidence-aware long-term credit at current alignment."""
@@ -146,10 +162,13 @@ class VersionedMemoryItem:
         ).to(dtype=dtype)
         return self
 
-    def rebase_capability_sketch(
-        self, current_sketch: torch.Tensor, dtype: torch.dtype
+    def rebase_capability_reference(
+        self,
+        current_sketch: torch.Tensor,
+        current_loss: float,
+        dtype: torch.dtype,
     ) -> None:
-        """Replace a stale sketch reference with a detached current snapshot."""
+        """Atomically rebase the sketch and loss to one capability version."""
 
         stored = current_sketch.detach().to(device="cpu").clone().float()
         if (
@@ -159,9 +178,24 @@ class VersionedMemoryItem:
             raise ValueError(
                 "current capability sketch must be finite and one-dimensional"
             )
+        reference_loss = float(current_loss)
+        if not math.isfinite(reference_loss) or reference_loss < 0.0:
+            raise ValueError(
+                "current capability loss must be finite and non-negative"
+            )
         normalized = F.normalize(stored, p=2, dim=-1, eps=1e-8)
         self.prediction_capability_sketch = normalized.to(dtype=dtype)
         self.normalized_sketch = normalized.to(dtype=dtype)
+        self.reference_capability_loss = reference_loss
+
+    def rebase_capability_sketch(
+        self, current_sketch: torch.Tensor, dtype: torch.dtype
+    ) -> None:
+        """Backward-compatible synchronized reference rebase."""
+
+        self.rebase_capability_reference(
+            current_sketch, self.recent_prediction_loss, dtype
+        )
 
     @property
     def stable_score(self) -> float:
@@ -375,12 +409,11 @@ class ExpertMemoryManager:
                 False, None, "directional_rejected"
             )
         if (
-            kind == "recovery"
-            and self.directional_recovery_enabled
-            and not math.isfinite(item.prediction_time_loss)
+            self.directional_recovery_enabled
+            and not math.isfinite(item.get_reference_capability_loss())
         ):
             raise ValueError(
-                "directional Recovery requires finite prediction_time_loss"
+                "directional Recovery requires finite reference_capability_loss"
             )
         target = (
             self.stable_buffers[expert_id]
@@ -430,15 +463,16 @@ class ExpertMemoryManager:
         alignment: float,
         current_loss: float,
     ) -> Optional[CapabilityEvolutionDecision]:
-        if not math.isfinite(item.prediction_time_loss):
+        reference_loss = item.get_reference_capability_loss()
+        if not math.isfinite(reference_loss):
             if self.directional_recovery_enabled:
                 raise ValueError(
-                    "directional Recovery requires finite prediction_time_loss"
+                    "directional Recovery requires finite reference_capability_loss"
                 )
             return None
         return classify_capability_evolution(
             alignment=alignment,
-            prediction_loss=item.prediction_time_loss,
+            prediction_loss=reference_loss,
             current_loss=current_loss,
             alignment_threshold=self.alignment_threshold,
             degradation_margin=self.recovery_degradation_margin,
@@ -449,11 +483,12 @@ class ExpertMemoryManager:
         self,
         item: VersionedMemoryItem,
         current_sketch: Optional[torch.Tensor],
+        current_loss: float,
     ) -> bool:
         if not self.capability_rebase_enabled or current_sketch is None:
             return False
-        item.rebase_capability_sketch(
-            current_sketch, dtype=self.storage_dtype
+        item.rebase_capability_reference(
+            current_sketch, current_loss, dtype=self.storage_dtype
         )
         return True
 
@@ -533,7 +568,7 @@ class ExpertMemoryManager:
                 and not item.recovery_eligible
             ):
                 stats["recovery_skipped_non_degraded"] += 1
-                if self._maybe_rebase(item, current_sketch):
+                if self._maybe_rebase(item, current_sketch, current_loss):
                     stats["capability_rebase"] += 1
                 continue
             demotions.append((expert_id, item))
@@ -603,7 +638,7 @@ class ExpertMemoryManager:
                     continue
                 if performance_recovered:
                     stats["performance_recovery"] += 1
-                    if self._maybe_rebase(removed, current_sketch):
+                    if self._maybe_rebase(removed, current_sketch, current_loss):
                         stats["capability_rebase"] += 1
                 if self.stable_buffers[expert_id].add(removed):
                     stats["recovery_to_stable"] += 1
@@ -705,7 +740,7 @@ class ExpertMemoryManager:
             if removed is None:
                 return "missing"
             if performance_recovered:
-                self._maybe_rebase(removed, current_sketch)
+                self._maybe_rebase(removed, current_sketch, current_loss)
             if self.stable_buffers[expert_id].add(removed):
                 return (
                     "promoted_performance"

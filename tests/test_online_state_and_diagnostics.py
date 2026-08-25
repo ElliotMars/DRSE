@@ -88,6 +88,13 @@ def test_credit_diagnostics_are_bounded_and_persisted(tmp_path) -> None:
     assert arrays["current_responsibility"].shape == (2, 2)
     assert arrays["prediction_expert_mse"].shape == (2, 2)
     assert arrays["current_expert_mse"].shape == (2, 2)
+    assert arrays["reference_capability_loss"].shape == (2, 2)
+    assert arrays["original_relative_capability_degradation"].shape == (2, 2)
+    assert arrays["reference_relative_capability_degradation"].shape == (2, 2)
+    assert np.array_equal(
+        arrays["reference_capability_loss"],
+        arrays["prediction_expert_mse"],
+    )
     assert arrays["capability_alignment_existing"].shape == (2, 2)
     assert arrays["capability_alignment"].shape == (2, 2)
     assert np.array_equal(
@@ -105,6 +112,8 @@ def test_credit_diagnostics_are_bounded_and_persisted(tmp_path) -> None:
     assert abs(summary["mean_js_divergence"] - 0.3) < 1e-12
     assert abs(summary["ranking_reversal_rate"] - 0.5) < 1e-12
     assert abs(summary["mean_alignment"] - 0.7) < 1e-12
+    assert summary["mean_original_relative_capability_degradation"] == 0.0
+    assert summary["mean_reference_relative_capability_degradation"] == 0.0
     assert abs(summary["min_alignment"] - 0.6) < 1e-12
 
 
@@ -260,6 +269,13 @@ def test_completed_record_diagnostic_uses_prediction_snapshot_and_version_delta(
     ]
     assert diagnostic["prediction_expert_mse"] == [0.0, 4.0]
     assert diagnostic["current_expert_mse"] == [1.0, 9.0]
+    assert diagnostic["reference_capability_loss"] == [0.0, 4.0]
+    assert diagnostic["original_relative_capability_degradation"] == (
+        diagnostic["relative_capability_degradation"]
+    )
+    assert diagnostic["reference_relative_capability_degradation"] == (
+        diagnostic["relative_capability_degradation"]
+    )
     assert diagnostic["prediction_mixture_mse"] == 2.25
     assert diagnostic["best_prediction_expert_mse"] == 0.0
     assert diagnostic["router_gap"] == 2.25
@@ -280,6 +296,9 @@ def test_completed_record_diagnostic_uses_prediction_snapshot_and_version_delta(
     assert arrays["current_responsibility"].shape == (1, 2)
     assert arrays["prediction_expert_mse"].shape == (1, 2)
     assert arrays["current_expert_mse"].shape == (1, 2)
+    assert arrays["reference_capability_loss"].shape == (1, 2)
+    assert arrays["original_relative_capability_degradation"].shape == (1, 2)
+    assert arrays["reference_relative_capability_degradation"].shape == (1, 2)
     assert arrays["capability_alignment_existing"].shape == (1, 2)
     assert arrays["capability_alignment"].shape == (1, 2)
     assert arrays["capability_l2_distance"].shape == (1, 2)
@@ -307,6 +326,9 @@ def test_empty_credit_diagnostics_keep_two_dimensional_expert_fields(tmp_path) -
     arrays = np.load(tmp_path / "credit_diagnostics.npz")
     assert arrays["prediction_responsibility"].shape == (0, 2)
     assert arrays["current_expert_mse"].shape == (0, 2)
+    assert arrays["reference_capability_loss"].shape == (0, 2)
+    assert arrays["original_relative_capability_degradation"].shape == (0, 2)
+    assert arrays["reference_relative_capability_degradation"].shape == (0, 2)
     assert arrays["capability_alignment_existing"].shape == (0, 2)
     assert arrays["capability_alignment"].shape == (0, 2)
     assert arrays["oracle_top2_pair"].shape == (0, 2)
@@ -323,4 +345,29 @@ def test_empty_credit_diagnostics_keep_two_dimensional_expert_fields(tmp_path) -
         comparator_json = json.load(handle)
     assert comparator_json["comparator_type"] == (
         "global_static_convex_comparator"
+    )
+
+def test_credit_diagnostics_separate_original_and_reference_losses(
+    tmp_path,
+) -> None:
+    experiment = Exp_TS2VecSupervised.__new__(Exp_TS2VecSupervised)
+    experiment.diagnostics = OnlineDiagnosticsRecorder(2, interval=1)
+    record = _credit_record(1, 0.0, [0.5, 0.5])
+    record["current_expert_mse"] = [0.8, 1.5]
+    record["reference_capability_loss"] = [0.5, 1.0]
+    experiment.credit_diagnostics = deque([record], maxlen=2)
+    experiment.credit_diagnostic_total_count = 1
+
+    experiment.save_online_diagnostics(str(tmp_path))
+
+    arrays = np.load(tmp_path / "credit_diagnostics.npz")
+    assert arrays["prediction_expert_mse"].tolist() == [[1.0, 2.0]]
+    assert arrays["reference_capability_loss"].tolist() == [[0.5, 1.0]]
+    assert np.allclose(
+        arrays["original_relative_capability_degradation"],
+        [[-0.2, -0.25]],
+    )
+    assert np.allclose(
+        arrays["reference_relative_capability_degradation"],
+        [[0.6, 0.5]],
     )

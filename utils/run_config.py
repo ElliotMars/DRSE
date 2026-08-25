@@ -247,6 +247,9 @@ def build_run_config(
             "capability_rebase_enabled": (
                 directional_recovery_enabled
             ),
+            "capability_reference_loss_enabled": (
+                directional_recovery_enabled
+            ),
             "credit_weighted_subspace": not bool(
                 getattr(args, "disable_credit_weighted_subspace", False)
             ),

@@ -124,6 +124,7 @@ def test_metadata_builder_preserves_paper_critical_values() -> None:
     assert config["directional_recovery_enabled"] is True
     assert config["recovery_degradation_margin"] == 0.05
     assert config["capability_rebase_enabled"] is True
+    assert config["capability_reference_loss_enabled"] is True
     assert config["credit_weighted_subspace"] is True
     assert config["subspace_rank_mode"] == "fixed"
     assert config["device"] == "cpu"
@@ -148,6 +149,7 @@ def test_directional_recovery_metadata_respects_ablations(overrides) -> None:
 
     assert config["directional_recovery_enabled"] is False
     assert config["capability_rebase_enabled"] is False
+    assert config["capability_reference_loss_enabled"] is False
 
 
 def test_run_config_json_round_trip_preserves_scalar_types(
