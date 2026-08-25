@@ -67,6 +67,8 @@ PAPER_CRITICAL_FIELDS = (
     "credit_top_k",
     "buffer_duplicate_threshold",
     "recovery_failure_penalty",
+    "recovery_degradation_margin",
+    "disable_directional_recovery",
     "max_recovery_attempts",
     "recovery_batch_size",
     "recovery_loss_weight",
@@ -216,6 +218,12 @@ def build_run_config(
     tsb_enabled = (
         online_enabled and effective_strategy in {"tsb", "hybrid"}
     )
+    directional_recovery_enabled = bool(
+        online_enabled
+        and not getattr(args, "disable_directional_recovery", False)
+        and not getattr(args, "disable_version_awareness", False)
+        and not getattr(args, "disable_recovery", False)
+    )
     config.update(
         {
             "causal_feedback_protocol": protocol,
@@ -232,6 +240,12 @@ def build_run_config(
             ),
             "recovery_enabled": online_enabled and not bool(
                 getattr(args, "disable_recovery", False)
+            ),
+            "directional_recovery_enabled": (
+                directional_recovery_enabled
+            ),
+            "capability_rebase_enabled": (
+                directional_recovery_enabled
             ),
             "credit_weighted_subspace": not bool(
                 getattr(args, "disable_credit_weighted_subspace", False)

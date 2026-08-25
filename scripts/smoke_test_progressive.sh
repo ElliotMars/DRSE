@@ -22,6 +22,8 @@ MAX_ONLINE_STEPS="${MAX_ONLINE_STEPS:-200}"
 STABLE_BUFFER_SIZE="${STABLE_BUFFER_SIZE:-8}"
 RECOVERY_BUFFER_SIZE="${RECOVERY_BUFFER_SIZE:-4}"
 RECOVERY_BATCH_SIZE="${RECOVERY_BATCH_SIZE:-1}"
+RECOVERY_DEGRADATION_MARGIN="${RECOVERY_DEGRADATION_MARGIN:-0.0}"
+DISABLE_DIRECTIONAL_RECOVERY="${DISABLE_DIRECTIONAL_RECOVERY:-0}"
 SUBSPACE_RANK="${SUBSPACE_RANK:-4}"
 SUBSPACE_MAX_RANK="${SUBSPACE_MAX_RANK:-8}"
 SUBSPACE_REFRESH_INTERVAL="${SUBSPACE_REFRESH_INTERVAL:-20}"
@@ -87,6 +89,9 @@ else
 fi
 
 STRICT_ARGS=()
+if [[ "$DISABLE_DIRECTIONAL_RECOVERY" == "1" ]]; then
+    STRICT_ARGS+=(--disable_directional_recovery)
+fi
 if [[ "$STRICT_ONLINE_CHECKS" == "1" ]]; then
     STRICT_ARGS+=(--strict_online_checks)
 fi
@@ -119,6 +124,7 @@ CUDA_VISIBLE_DEVICES="$GPU_ID" "$PYTHON_BIN" -u main.py \
     --stable_buffer_size "$STABLE_BUFFER_SIZE" \
     --recovery_buffer_size "$RECOVERY_BUFFER_SIZE" \
     --recovery_batch_size "$RECOVERY_BATCH_SIZE" \
+    --recovery_degradation_margin "$RECOVERY_DEGRADATION_MARGIN" \
     --memory_refresh_interval "${MEMORY_REFRESH_INTERVAL:-20}" \
     --subspace_scope regressor \
     --subspace_rank "$SUBSPACE_RANK" \

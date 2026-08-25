@@ -61,6 +61,7 @@ run_variant strategy_plain --expert_update_strategy plain
 run_variant strategy_tsb --expert_update_strategy tsb
 run_variant strategy_subspace --expert_update_strategy subspace
 run_variant strategy_hybrid --expert_update_strategy hybrid
+run_variant direction_awareness_off --disable_directional_recovery
 
 run_variant controller_fixed --adaptive_controller fixed
 run_variant controller_dynamic --adaptive_controller dynamic

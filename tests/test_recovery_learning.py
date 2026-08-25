@@ -204,7 +204,7 @@ def test_attempt_exhaustion_does_not_count_as_recovery_eviction() -> None:
     experiment.model = _ReplayDiagnosticModel()
     experiment.min_credit_eps = 1e-8
     experiment.memory_manager = SimpleNamespace(
-        update_recovery_result=lambda *args: "dropped"
+        update_recovery_result=lambda *args, **kwargs: "dropped"
     )
     experiment.diagnostics = OnlineDiagnosticsRecorder(1, interval=1)
     normalized = torch.nn.functional.normalize(

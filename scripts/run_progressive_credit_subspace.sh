@@ -61,6 +61,8 @@ TOP_K="${TOP_K:-$NUM_EXPERTS}"
 RECOVERY_BATCH_SIZE="${RECOVERY_BATCH_SIZE:-2}"
 RECOVERY_LOSS_WEIGHT="${RECOVERY_LOSS_WEIGHT:-0.1}"
 RECOVERY_SKETCH_WEIGHT="${RECOVERY_SKETCH_WEIGHT:-1.0}"
+RECOVERY_DEGRADATION_MARGIN="${RECOVERY_DEGRADATION_MARGIN:-0.0}"
+DISABLE_DIRECTIONAL_RECOVERY="${DISABLE_DIRECTIONAL_RECOVERY:-0}"
 SUBSPACE_MAX_RANK="${SUBSPACE_MAX_RANK:-32}"
 SUBSPACE_ENERGY_THRESHOLD="${SUBSPACE_ENERGY_THRESHOLD:-0.95}"
 SUBSPACE_REFRESH_INTERVAL="${SUBSPACE_REFRESH_INTERVAL:-100}"
@@ -71,6 +73,9 @@ MEMORY_REFRESH_INTERVAL="${MEMORY_REFRESH_INTERVAL:-100}"
 ONLINE_LOG_INTERVAL="${ONLINE_LOG_INTERVAL:-500}"
 MAX_ONLINE_STEPS="${MAX_ONLINE_STEPS:--1}"
 STRICT_ONLINE_CHECKS="${STRICT_ONLINE_CHECKS:-0}"
+ITR="${ITR:-1}"
+SEED="${SEED:-0}"
+ONLINE_LEARNING="${ONLINE_LEARNING:-full}"
 
 declare -a RUN_PIDS=()
 declare -A PID_GPU=()
@@ -118,6 +123,8 @@ append_disable_flags() {
         EXTRA_FLAGS+=(--disable_version_awareness)
     [[ "${DISABLE_RECOVERY:-0}" == "1" ]] &&
         EXTRA_FLAGS+=(--disable_recovery)
+    [[ "$DISABLE_DIRECTIONAL_RECOVERY" == "1" ]] &&
+        EXTRA_FLAGS+=(--disable_directional_recovery)
     [[ "${DISABLE_CREDIT_WEIGHTED_SUBSPACE:-0}" == "1" ]] &&
         EXTRA_FLAGS+=(--disable_credit_weighted_subspace)
     [[ "${DISABLE_ONLINE_CORRECTION:-0}" == "1" ]] &&
@@ -187,7 +194,7 @@ for data in "${datasets[@]}"; do
         --pred_len "$pred_len" \
         --test_bsz 1 \
         --batch_size 32 \
-        --itr 1 \
+        --itr "$ITR" \
         --train_epochs 15 \
         --patience 3 \
         --learning_rate "$offline_lr" \
@@ -195,7 +202,7 @@ for data in "${datasets[@]}"; do
         --learning_rate_router "$offline_lr" \
         --online_lr_expert "$online_expert_lr" \
         --online_lr_router "$online_router_lr" \
-        --online_learning full \
+        --online_learning "$ONLINE_LEARNING"\
         --delay_fb \
         --progressive_fb \
         --router_granularity "$ROUTER_GRANULARITY" \
@@ -206,6 +213,7 @@ for data in "${datasets[@]}"; do
         --recovery_batch_size "$RECOVERY_BATCH_SIZE" \
         --recovery_loss_weight "$RECOVERY_LOSS_WEIGHT" \
         --recovery_sketch_weight "$RECOVERY_SKETCH_WEIGHT" \
+        --recovery_degradation_margin "$RECOVERY_DEGRADATION_MARGIN" \
         --memory_refresh_interval "$MEMORY_REFRESH_INTERVAL" \
         --subspace_scope regressor \
         --subspace_rank "$SUBSPACE_RANK" \
@@ -221,6 +229,7 @@ for data in "${datasets[@]}"; do
         --top_k "$TOP_K" \
         --online_log_interval "$ONLINE_LOG_INTERVAL" \
         --max_online_steps "$MAX_ONLINE_STEPS" \
+        --seed "$SEED" \
         "${EXTRA_FLAGS[@]}" \
         "${pretrain_args[@]}" > "$log" 2>&1 &
     pid=$!

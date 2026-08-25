@@ -7,7 +7,7 @@ import warnings
 from collections import defaultdict
 from collections import deque
 from contextlib import contextmanager
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -35,7 +35,11 @@ from utils.credit_assignment import (
     jensen_shannon_divergence,
     partial_router_objective,
 )
-from utils.expert_memory import ExpertMemoryManager, VersionedMemoryItem
+from utils.expert_memory import (
+    ExpertMemoryManager,
+    VersionedMemoryItem,
+    classify_capability_evolution,
+)
 from utils.evaluation_diagnostics import (
     SpecializationDiagnosticsAggregator,
     compute_router_oracle_diagnostics,
@@ -556,6 +560,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.recovery_enabled = not bool(
             getattr(args, "disable_recovery", False)
         )
+        self.directional_recovery_enabled = (
+            self.version_awareness_enabled
+            and self.recovery_enabled
+            and not bool(
+                getattr(args, "disable_directional_recovery", False)
+            )
+        )
+        self.capability_rebase_enabled = (
+            self.directional_recovery_enabled
+        )
         self.expert_online_update_enabled = not bool(
             getattr(args, "disable_expert_online_update", False)
         )
@@ -587,6 +601,16 @@ class Exp_TS2VecSupervised(Exp_Basic):
             getattr(args, "local_credit_weight", 0.1)
         )
         self.min_credit_eps = float(getattr(args, "min_credit_eps", 1e-8))
+        self.recovery_degradation_margin = float(
+            getattr(args, "recovery_degradation_margin", 0.0)
+        )
+        if (
+            not math.isfinite(self.recovery_degradation_margin)
+            or self.recovery_degradation_margin < 0.0
+        ):
+            raise ValueError(
+                "recovery_degradation_margin must be finite and non-negative"
+            )
         self.responsibility_threshold = float(
             getattr(args, "responsibility_threshold", 0.3)
         )
@@ -641,6 +665,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
             promote_loss_threshold=float(
                 getattr(args, "promote_loss_threshold", 1.0)
             ),
+            directional_recovery_enabled=self.directional_recovery_enabled,
+            version_awareness_enabled=self.version_awareness_enabled,
+            recovery_degradation_margin=self.recovery_degradation_margin,
+            degradation_eps=self.min_credit_eps,
+            capability_rebase_enabled=self.capability_rebase_enabled,
         )
         self.subspace_scope = str(getattr(args, "subspace_scope", "regressor"))
         if self.subspace_scope != "regressor":
@@ -1249,28 +1278,44 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 ((current_sketch * historical).sum(dim=-1).clamp(-1.0, 1.0) + 1.0)
                 / 2.0
             ).clamp(0.0, 1.0)
-            for item, alignment, loss in zip(
-                batch["items"], alignments, losses
+            for item, alignment, loss, sketch in zip(
+                batch["items"], alignments, losses, current_sketch
             ):
                 status = self.memory_manager.update_recovery_result(
                     expert_id,
                     item.sample_id,
                     float(alignment.item()),
                     float(loss.item()),
+                    current_sketch=sketch.detach(),
                 )
                 self.diagnostics.increment(recovery_attempts=1)
-                if status == "promoted":
-                    self.diagnostics.increment(
-                        recovery_successes=1,
-                        recovery_to_stable=1,
-                        promotion_count=1,
-                    )
-                elif status == "dropped_after_recovery":
-                    self.diagnostics.increment(
-                        recovery_successes=1,
-                        recovery_dropped_after_success=1,
-                        drop_count=1,
-                    )
+                if status in {"promoted", "promoted_performance"}:
+                    counts = {
+                        "recovery_successes": 1,
+                        "recovery_to_stable": 1,
+                        "promotion_count": 1,
+                    }
+                    if status == "promoted_performance":
+                        counts.update(
+                            performance_recovery_count=1,
+                            capability_rebase_count=1,
+                        )
+                    self.diagnostics.increment(**counts)
+                elif status in {
+                    "dropped_after_recovery",
+                    "dropped_after_performance_recovery",
+                }:
+                    counts = {
+                        "recovery_successes": 1,
+                        "recovery_dropped_after_success": 1,
+                        "drop_count": 1,
+                    }
+                    if status == "dropped_after_performance_recovery":
+                        counts.update(
+                            performance_recovery_count=1,
+                            capability_rebase_count=1,
+                        )
+                    self.diagnostics.increment(**counts)
                 elif status == "recovery":
                     self.diagnostics.increment(recovery_failed=1)
                 elif status == "dropped":
@@ -1813,6 +1858,43 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if expert_update_delta < 0:
             raise RuntimeError("Expert update counter moved backwards")
         current_expert_mse = current_squared_error.mean(dim=(0, 1))
+        decisions = [
+            classify_capability_evolution(
+                alignment=float(alignment[expert_id].item()),
+                prediction_loss=float(
+                    prediction_expert_mse[expert_id].item()
+                ),
+                current_loss=float(current_expert_mse[expert_id].item()),
+                alignment_threshold=float(
+                    getattr(self, "alignment_threshold", 0.8)
+                ),
+                degradation_margin=float(
+                    getattr(self, "recovery_degradation_margin", 0.0)
+                ),
+                eps=self.min_credit_eps,
+            )
+            for expert_id in range(self.model.num_experts)
+        ]
+        category_codes = {
+            "retained": 0,
+            "harmful_drift": 1,
+            "beneficial_or_neutral_evolution": 2,
+        }
+        evolution_categories = [decision.category for decision in decisions]
+        relative_degradation = [
+            decision.relative_degradation for decision in decisions
+        ]
+        degraded_flags = [decision.degraded for decision in decisions]
+        harmful_flags = [
+            decision.category == "harmful_drift" for decision in decisions
+        ]
+        beneficial_flags = [
+            decision.category == "beneficial_or_neutral_evolution"
+            for decision in decisions
+        ]
+        evolution_codes = [
+            category_codes[decision.category] for decision in decisions
+        ]
         alignment_values = alignment.detach().cpu().tolist()
         diagnostic = {
             "origin": record.origin,
@@ -1826,6 +1908,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 prediction_expert_mse.detach().cpu().tolist()
             ),
             "current_expert_mse": current_expert_mse.detach().cpu().tolist(),
+            "relative_capability_degradation": relative_degradation,
+            "capability_degraded": degraded_flags,
+            "capability_evolution": evolution_categories,
+            "capability_evolution_code": evolution_codes,
+            "harmful_drift": harmful_flags,
+            "beneficial_or_neutral_evolution": beneficial_flags,
             "js_divergence": float(js_divergence.item()),
             "ranking_reversal": ranking_reversal,
             "capability_alignment_existing": alignment_values,
@@ -1860,6 +1948,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.credit_diagnostics.append(diagnostic)
         self.credit_diagnostic_total_count += 1
         record.metadata["version_diagnostic"] = diagnostic
+        record.metadata["current_capability_sketch"] = (
+            sketch_now.detach().cpu().clone()
+        )
+        self.diagnostics.increment(
+            harmful_drift_count=sum(harmful_flags),
+            beneficial_evolution_count=sum(beneficial_flags),
+        )
         sample_entropy = -(
             prediction_responsibility.clamp_min(self.min_credit_eps)
             * prediction_responsibility.clamp_min(self.min_credit_eps).log()
@@ -1871,13 +1966,20 @@ class Exp_TS2VecSupervised(Exp_Basic):
             ranking_reversal=float(ranking_reversal),
             capability_alignment_existing=alignment.detach().cpu().numpy(),
             capability_alignment=alignment.detach().cpu().numpy(),
+            relative_capability_degradation=np.asarray(
+                relative_degradation, dtype=np.float64
+            ),
+            harmful_drift=np.asarray(harmful_flags, dtype=np.float64),
+            beneficial_or_neutral_evolution=np.asarray(
+                beneficial_flags, dtype=np.float64
+            ),
             router_gap=router_gap,
         )
         return (
             alignment.detach(),
             sketch_l2.detach(),
             current_credit.responsibility.detach(),
-            current_expert_mse.detach(),
+            prediction_expert_mse.detach(),
         )
 
     def _build_memory_candidates(
@@ -1886,27 +1988,79 @@ class Exp_TS2VecSupervised(Exp_Basic):
         alignment: torch.Tensor,
         prediction_loss: torch.Tensor,
         timestamp: int,
+        current_loss: Optional[torch.Tensor] = None,
     ) -> List[VersionedMemoryItem]:
         """Classify a completed record without mutating memory yet."""
 
         responsibility = record.sample_responsibility.float()
+        prediction_loss = prediction_loss.float()
+        current_loss = (
+            prediction_loss if current_loss is None else current_loss.float()
+        )
+        if prediction_loss.shape != alignment.shape:
+            raise ValueError(
+                "prediction loss and alignment must have matching Expert shapes"
+            )
+        if current_loss.shape != alignment.shape:
+            raise ValueError(
+                "current loss and alignment must have matching Expert shapes"
+            )
         sample_confidence = float(record.sample_confidence)
         if not math.isfinite(sample_confidence):
             raise FloatingPointError("sample confidence contains NaN or Inf")
         if not 0.0 <= sample_confidence <= 1.0:
             raise ValueError("sample confidence must be in [0,1]")
-        top_k = torch.topk(responsibility, k=self.credit_top_k).indices.tolist()
+        top_k = torch.topk(
+            responsibility, k=self.credit_top_k
+        ).indices.tolist()
         candidates: List[VersionedMemoryItem] = []
+        directional_enabled = bool(
+            getattr(self, "directional_recovery_enabled", False)
+            and getattr(self, "version_awareness_enabled", True)
+        )
         for expert_id in top_k:
             expert_responsibility = float(responsibility[expert_id].item())
             if expert_responsibility < self.responsibility_threshold:
                 continue
+            observed_alignment = float(alignment[expert_id].item())
+            decision = classify_capability_evolution(
+                alignment=observed_alignment,
+                prediction_loss=float(prediction_loss[expert_id].item()),
+                current_loss=float(current_loss[expert_id].item()),
+                alignment_threshold=self.alignment_threshold,
+                degradation_margin=float(
+                    getattr(self, "recovery_degradation_margin", 0.0)
+                ),
+                eps=float(getattr(self, "min_credit_eps", 1e-8)),
+            )
             expert_alignment = (
-                float(alignment[expert_id].item())
+                observed_alignment
                 if self.version_awareness_enabled
                 else 1.0
             )
-            if not self.recovery_enabled and expert_alignment < self.alignment_threshold:
+            low_alignment = (
+                self.version_awareness_enabled
+                and expert_alignment < self.alignment_threshold
+            )
+            recovery_eligible = bool(
+                not directional_enabled
+                or (
+                    low_alignment
+                    and decision.category == "harmful_drift"
+                )
+            )
+            if low_alignment and not self.recovery_enabled:
+                continue
+            if (
+                low_alignment
+                and directional_enabled
+                and not recovery_eligible
+            ):
+                diagnostics = getattr(self, "diagnostics", None)
+                if diagnostics is not None:
+                    diagnostics.increment(
+                        recovery_skipped_non_degraded_count=1
+                    )
                 continue
             candidates.append(
                 VersionedMemoryItem(
@@ -1934,9 +2088,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
                         * (1.0 - expert_alignment)
                     ),
                     timestamp=timestamp,
-                    recent_prediction_loss=float(
+                    prediction_time_loss=float(
                         prediction_loss[expert_id].item()
                     ),
+                    recent_prediction_loss=float(
+                        current_loss[expert_id].item()
+                    ),
+                    last_observed_alignment=observed_alignment,
+                    recovery_eligible=recovery_eligible,
+                    capability_evolution=decision.category,
                 )
             )
         return candidates
@@ -1945,10 +2105,25 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self, candidates: List[VersionedMemoryItem]
     ) -> None:
         recovery_capacity_evictions = 0
+        directional_admissions = 0
         for item in candidates:
             kind, result = self.memory_manager.add_candidate_with_result(item)
+            if (
+                kind == "recovery"
+                and getattr(
+                    self.memory_manager,
+                    "directional_recovery_enabled",
+                    False,
+                )
+                and item.capability_evolution == "harmful_drift"
+            ):
+                directional_admissions += 1
             if kind == "recovery" and result.reason == "replaced":
                 recovery_capacity_evictions += 1
+        if directional_admissions:
+            self.diagnostics.increment(
+                directional_recovery_admission_count=directional_admissions
+            )
         if recovery_capacity_evictions:
             self.diagnostics.increment(
                 recovery_evicted=recovery_capacity_evictions,
@@ -1983,6 +2158,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 "recovery_evicted": 0,
                 "recovery_attempt_exhausted": 0,
                 "evicted": 0,
+                "harmful_drift": 0,
+                "beneficial_evolution": 0,
+                "recovery_skipped_non_degraded": 0,
+                "performance_recovery": 0,
+                "capability_rebase": 0,
             }
 
         sample_ids = list(unique_items)
@@ -2015,18 +2195,24 @@ class Exp_TS2VecSupervised(Exp_Basic):
             old_sketch = item.normalized_sketch.float().to(self.device)
             alignment = (
                 (
-                    (torch.dot(old_sketch, current_sketch).clamp(-1.0, 1.0) + 1.0)
+                    (
+                        torch.dot(old_sketch, current_sketch)
+                        .clamp(-1.0, 1.0)
+                        + 1.0
+                    )
                     / 2.0
                 ).clamp(0.0, 1.0)
-                if self.version_awareness_enabled
-                else torch.ones((), device=self.device)
             )
             target = item.target.float().to(self.device).reshape(
                 self.args.pred_len, self.args.c_out
             )
             prediction = predictions[index, expert_id]
             loss = (prediction - target).pow(2).mean()
-            return float(alignment.item()), float(loss.item())
+            return (
+                float(alignment.item()),
+                float(loss.item()),
+                current_sketch.detach(),
+            )
 
         return self.memory_manager.refresh(
             evaluator, timestamp=timestamp, count_recovery_attempts=False
@@ -2140,6 +2326,26 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 recovery_attempt_exhausted=stats.get(
                     "recovery_attempt_exhausted", 0
                 ),
+                directional_recovery_admission_count=(
+                    stats.get("stable_to_recovery", 0)
+                    if getattr(
+                        self, "directional_recovery_enabled", False
+                    )
+                    else 0
+                ),
+                harmful_drift_count=stats.get("harmful_drift", 0),
+                beneficial_evolution_count=stats.get(
+                    "beneficial_evolution", 0
+                ),
+                recovery_skipped_non_degraded_count=stats.get(
+                    "recovery_skipped_non_degraded", 0
+                ),
+                performance_recovery_count=stats.get(
+                    "performance_recovery", 0
+                ),
+                capability_rebase_count=stats.get(
+                    "capability_rebase", 0
+                ),
             )
         if subspace_due:
             self._refresh_subspaces(step=timestamp)
@@ -2179,9 +2385,26 @@ class Exp_TS2VecSupervised(Exp_Basic):
         alignment, _, _, prediction_loss = self._evaluate_completed_record(
             completed, origin
         )
-        candidates = self._build_memory_candidates(
-            completed, alignment, prediction_loss, timestamp=origin
+        version_diagnostic = getattr(completed, "metadata", {}).get(
+            "version_diagnostic"
         )
+        if version_diagnostic is None:
+            candidates = self._build_memory_candidates(
+                completed, alignment, prediction_loss, timestamp=origin
+            )
+        else:
+            current_loss = torch.tensor(
+                version_diagnostic["current_expert_mse"],
+                dtype=prediction_loss.dtype,
+                device=prediction_loss.device,
+            )
+            candidates = self._build_memory_candidates(
+                completed,
+                alignment,
+                prediction_loss,
+                timestamp=origin,
+                current_loss=current_loss,
+            )
         reconstructed_target = completed.matured_targets.unsqueeze(0)
         # The current sample learns through the old basis first.  Only after
         # the optimizer step may it enter memory and influence a future basis.
@@ -2528,6 +2751,57 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 )
             return values
 
+        def direction_field(name: str) -> np.ndarray:
+            """Load direction diagnostics or derive them for old records."""
+
+            if not records:
+                return np.empty((0, num_experts), dtype=np.float64)
+            values = []
+            margin = float(
+                getattr(self, "recovery_degradation_margin", 0.0)
+            )
+            eps = float(getattr(self, "min_credit_eps", 1e-8))
+            threshold = float(getattr(self, "alignment_threshold", 0.8))
+            for record in records:
+                if name in record:
+                    values.append(record[name])
+                    continue
+                prediction = np.asarray(
+                    record["prediction_expert_mse"], dtype=np.float64
+                )
+                current = np.asarray(
+                    record["current_expert_mse"], dtype=np.float64
+                )
+                alignment = np.asarray(
+                    record.get(
+                        "capability_alignment_existing",
+                        record["capability_alignment"],
+                    ),
+                    dtype=np.float64,
+                )
+                relative = (current - prediction) / (prediction + eps)
+                degraded = current > prediction * (1.0 + margin) + eps
+                harmful = (alignment < threshold) & degraded
+                beneficial = (alignment < threshold) & ~degraded
+                derived = {
+                    "relative_capability_degradation": relative,
+                    "capability_degraded": degraded,
+                    "harmful_drift": harmful,
+                    "beneficial_or_neutral_evolution": beneficial,
+                    "capability_evolution_code": np.where(
+                        harmful, 1, np.where(beneficial, 2, 0)
+                    ),
+                }
+                values.append(derived[name])
+            result = np.asarray(values, dtype=np.float64)
+            expected = (len(records), num_experts)
+            if result.shape != expected:
+                raise ValueError(
+                    f"credit diagnostic {name} must have shape {expected}, "
+                    f"got {result.shape}"
+                )
+            return result
+
         fields = {
             "origin": np.asarray([r["origin"] for r in records], dtype=np.int64),
             "prediction_responsibility": expert_field(
@@ -2536,6 +2810,21 @@ class Exp_TS2VecSupervised(Exp_Basic):
             "current_responsibility": expert_field("current_responsibility"),
             "prediction_expert_mse": expert_field("prediction_expert_mse"),
             "current_expert_mse": expert_field("current_expert_mse"),
+            "relative_capability_degradation": direction_field(
+                "relative_capability_degradation"
+            ),
+            "capability_evolution_code": direction_field(
+                "capability_evolution_code"
+            ).astype(np.int64),
+            "capability_degraded": direction_field(
+                "capability_degraded"
+            ).astype(np.bool_),
+            "harmful_drift": direction_field("harmful_drift").astype(
+                np.bool_
+            ),
+            "beneficial_or_neutral_evolution": direction_field(
+                "beneficial_or_neutral_evolution"
+            ).astype(np.bool_),
             "capability_alignment_existing": expert_field(
                 "capability_alignment_existing", "capability_alignment"
             ),
@@ -2643,6 +2932,37 @@ class Exp_TS2VecSupervised(Exp_Basic):
             ),
             "mean_alignment": (
                 float(fields["mean_alignment"].mean()) if retained else None
+            ),
+            "mean_relative_capability_degradation": (
+                float(
+                    fields["relative_capability_degradation"].mean()
+                )
+                if retained
+                else None
+            ),
+            "harmful_drift_rate": (
+                float(fields["harmful_drift"].mean())
+                if retained
+                else None
+            ),
+            "beneficial_evolution_rate": (
+                float(
+                    fields[
+                        "beneficial_or_neutral_evolution"
+                    ].mean()
+                )
+                if retained
+                else None
+            ),
+            "recovery_skipped_non_degraded_count": float(
+                self.diagnostics.counters.get(
+                    "recovery_skipped_non_degraded_count", 0.0
+                )
+            ),
+            "performance_recovery_count": float(
+                self.diagnostics.counters.get(
+                    "performance_recovery_count", 0.0
+                )
             ),
             "min_alignment": (
                 float(fields["min_alignment"].min()) if retained else None

@@ -229,6 +229,8 @@ def parse_args():
     parser.add_argument('--recovery_failure_penalty', type=float, default=0.5)
     parser.add_argument('--max_recovery_attempts', type=int, default=3,
                         help='maximum failed Recovery attempts; evict on the max-th failure')
+    parser.add_argument('--recovery_degradation_margin', type=float, default=0.0,
+                        help='relative loss margin required for harmful capability drift')
     parser.add_argument('--buffer_storage_dtype', type=str, default='fp16',
                         choices=['fp16', 'fp32'])
     parser.add_argument('--memory_refresh_interval', type=int, default=100)
@@ -255,6 +257,9 @@ def parse_args():
                         choices=['plain', 'tsb', 'subspace', 'hybrid'])
     parser.add_argument('--disable_version_awareness', action='store_true',
                         default=False)
+    parser.add_argument('--disable_directional_recovery', action='store_true',
+                        default=False,
+                        help='restore alignment-only Recovery admission and stopping')
     parser.add_argument('--disable_recovery', action='store_true', default=False)
     parser.add_argument('--disable_credit_weighted_subspace', action='store_true',
                         default=False,

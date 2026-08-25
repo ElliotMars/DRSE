@@ -7,6 +7,57 @@ import torch.nn.functional as F
 
 
 MemoryKind = Literal["stable", "recovery"]
+CapabilityEvolution = Literal[
+    "retained", "harmful_drift", "beneficial_or_neutral_evolution"
+]
+
+
+@dataclass(frozen=True)
+class CapabilityEvolutionDecision:
+    category: CapabilityEvolution
+    degraded: bool
+    relative_degradation: float
+
+
+def classify_capability_evolution(
+    alignment: float,
+    prediction_loss: float,
+    current_loss: float,
+    alignment_threshold: float,
+    degradation_margin: float = 0.0,
+    eps: float = 1e-8,
+) -> CapabilityEvolutionDecision:
+    """Classify representation drift by its historical performance direction."""
+
+    values = (
+        float(alignment),
+        float(prediction_loss),
+        float(current_loss),
+        float(alignment_threshold),
+        float(degradation_margin),
+        float(eps),
+    )
+    if not all(math.isfinite(value) for value in values):
+        raise FloatingPointError("capability evolution inputs contain NaN or Inf")
+    if prediction_loss < 0.0 or current_loss < 0.0:
+        raise ValueError("capability losses must be non-negative")
+    if degradation_margin < 0.0 or eps <= 0.0:
+        raise ValueError(
+            "degradation margin must be non-negative and eps positive"
+        )
+    degraded = (
+        current_loss
+        > prediction_loss * (1.0 + degradation_margin) + eps
+    )
+    relative = (current_loss - prediction_loss) / (prediction_loss + eps)
+    if alignment >= alignment_threshold:
+        category: CapabilityEvolution = "retained"
+    elif degraded:
+        category = "harmful_drift"
+    else:
+        category = "beneficial_or_neutral_evolution"
+    return CapabilityEvolutionDecision(category, degraded, relative)
+
 
 
 def _storage_dtype(name: str) -> torch.dtype:
@@ -37,9 +88,16 @@ class VersionedMemoryItem:
     recent_prediction_loss: float = float("inf")
     normalized_sketch: Optional[torch.Tensor] = None
     sample_confidence: float = 1.0
+    prediction_time_loss: float = float("inf")
+    last_observed_alignment: float = 1.0
+    recovery_eligible: bool = True
+    capability_evolution: CapabilityEvolution = "retained"
 
     def __post_init__(self) -> None:
         self.sample_confidence = float(self.sample_confidence)
+        self.prediction_time_loss = float(self.prediction_time_loss)
+        self.last_observed_alignment = float(self.last_observed_alignment)
+        self.recovery_eligible = bool(self.recovery_eligible)
         if not math.isfinite(self.sample_confidence):
             raise FloatingPointError("sample_confidence contains NaN or Inf")
         if not 0.0 <= self.sample_confidence <= 1.0:
@@ -58,6 +116,8 @@ class VersionedMemoryItem:
             self.sample_confidence
             * self.sample_responsibility
             * (1.0 - self.last_alignment)
+            if self.recovery_eligible
+            else 0.0
         )
         if not (
             math.isfinite(self.stable_credit)
@@ -85,6 +145,23 @@ class VersionedMemoryItem:
             sketch.float(), p=2, dim=-1, eps=1e-8
         ).to(dtype=dtype)
         return self
+
+    def rebase_capability_sketch(
+        self, current_sketch: torch.Tensor, dtype: torch.dtype
+    ) -> None:
+        """Replace a stale sketch reference with a detached current snapshot."""
+
+        stored = current_sketch.detach().to(device="cpu").clone().float()
+        if (
+            stored.ndim != 1
+            or not bool(torch.isfinite(stored).all().item())
+        ):
+            raise ValueError(
+                "current capability sketch must be finite and one-dimensional"
+            )
+        normalized = F.normalize(stored, p=2, dim=-1, eps=1e-8)
+        self.prediction_capability_sketch = normalized.to(dtype=dtype)
+        self.normalized_sketch = normalized.to(dtype=dtype)
 
     @property
     def stable_score(self) -> float:
@@ -221,6 +298,11 @@ class ExpertMemoryManager:
         storage_dtype: str = "fp16",
         promote_alignment_threshold: float = 0.9,
         promote_loss_threshold: float = 1.0,
+        directional_recovery_enabled: bool = False,
+        version_awareness_enabled: bool = True,
+        recovery_degradation_margin: float = 0.0,
+        degradation_eps: float = 1e-8,
+        capability_rebase_enabled: bool = True,
     ) -> None:
         if num_experts <= 0:
             raise ValueError("num_experts must be positive")
@@ -233,6 +315,25 @@ class ExpertMemoryManager:
         self.storage_dtype = _storage_dtype(storage_dtype)
         self.promote_alignment_threshold = float(promote_alignment_threshold)
         self.promote_loss_threshold = float(promote_loss_threshold)
+        self.version_awareness_enabled = bool(version_awareness_enabled)
+        self.directional_recovery_enabled = bool(
+            directional_recovery_enabled
+            and self.version_awareness_enabled
+        )
+        self.recovery_degradation_margin = float(
+            recovery_degradation_margin
+        )
+        self.degradation_eps = float(degradation_eps)
+        self.capability_rebase_enabled = bool(capability_rebase_enabled)
+        if (
+            not math.isfinite(self.recovery_degradation_margin)
+            or self.recovery_degradation_margin < 0.0
+        ):
+            raise ValueError(
+                "recovery_degradation_margin must be finite and non-negative"
+            )
+        if not math.isfinite(self.degradation_eps) or self.degradation_eps <= 0.0:
+            raise ValueError("degradation_eps must be finite and positive")
         self.stable_buffers = [
             FixedCapacityExpertBuffer(
                 stable_capacity, "stable", duplicate_threshold, failure_penalty
@@ -262,6 +363,25 @@ class ExpertMemoryManager:
             if item.last_alignment >= self.alignment_threshold
             else "recovery"
         )
+        if self.directional_recovery_enabled and kind == "stable":
+            item.recovery_eligible = False
+            item.refresh_credit()
+        if (
+            kind == "recovery"
+            and self.directional_recovery_enabled
+            and not item.recovery_eligible
+        ):
+            return None, BufferAddResult(
+                False, None, "directional_rejected"
+            )
+        if (
+            kind == "recovery"
+            and self.directional_recovery_enabled
+            and not math.isfinite(item.prediction_time_loss)
+        ):
+            raise ValueError(
+                "directional Recovery requires finite prediction_time_loss"
+            )
         target = (
             self.stable_buffers[expert_id]
             if kind == "stable"
@@ -284,15 +404,66 @@ class ExpertMemoryManager:
         kind, _ = self.add_candidate_with_result(item)
         return kind
 
+    @staticmethod
+    def _unpack_evaluation(
+        evaluation: tuple,
+    ) -> tuple[float, float, Optional[torch.Tensor]]:
+        if len(evaluation) not in {2, 3}:
+            raise ValueError(
+                "memory evaluator must return alignment, loss, and optional sketch"
+            )
+        alignment = float(evaluation[0])
+        current_loss = float(evaluation[1])
+        current_sketch = evaluation[2] if len(evaluation) == 3 else None
+        values = torch.tensor(
+            [alignment, current_loss], dtype=torch.float64
+        )
+        if not bool(torch.isfinite(values).all().item()):
+            raise FloatingPointError(
+                "memory evaluation contains NaN or Inf"
+            )
+        return alignment, current_loss, current_sketch
+
+    def _direction_decision(
+        self,
+        item: VersionedMemoryItem,
+        alignment: float,
+        current_loss: float,
+    ) -> Optional[CapabilityEvolutionDecision]:
+        if not math.isfinite(item.prediction_time_loss):
+            if self.directional_recovery_enabled:
+                raise ValueError(
+                    "directional Recovery requires finite prediction_time_loss"
+                )
+            return None
+        return classify_capability_evolution(
+            alignment=alignment,
+            prediction_loss=item.prediction_time_loss,
+            current_loss=current_loss,
+            alignment_threshold=self.alignment_threshold,
+            degradation_margin=self.recovery_degradation_margin,
+            eps=self.degradation_eps,
+        )
+
+    def _maybe_rebase(
+        self,
+        item: VersionedMemoryItem,
+        current_sketch: Optional[torch.Tensor],
+    ) -> bool:
+        if not self.capability_rebase_enabled or current_sketch is None:
+            return False
+        item.rebase_capability_sketch(
+            current_sketch, dtype=self.storage_dtype
+        )
+        return True
+
     def refresh(
         self,
-        evaluator: Callable[
-            [int, VersionedMemoryItem], Tuple[float, float]
-        ],
+        evaluator: Callable[[int, VersionedMemoryItem], tuple],
         timestamp: int,
         count_recovery_attempts: bool = True,
     ) -> dict[str, int]:
-        """Re-evaluate snapshots, then migrate using container snapshots."""
+        """Re-evaluate snapshots and apply direction-aware migrations."""
 
         stats = {
             "stable_to_recovery": 0,
@@ -302,6 +473,11 @@ class ExpertMemoryManager:
             "recovery_evicted": 0,
             "recovery_attempt_exhausted": 0,
             "evicted": 0,
+            "harmful_drift": 0,
+            "beneficial_evolution": 0,
+            "recovery_skipped_non_degraded": 0,
+            "performance_recovery": 0,
+            "capability_rebase": 0,
         }
         stable_snapshots = [
             (expert_id, item)
@@ -318,15 +494,51 @@ class ExpertMemoryManager:
         for expert_id, item in stable_snapshots:
             if not self.stable_buffers[expert_id].contains(item.sample_id):
                 continue
-            alignment, prediction_loss = evaluator(expert_id, item)
-            item.last_alignment = float(alignment)
-            item.recent_prediction_loss = float(prediction_loss)
+            alignment, current_loss, current_sketch = self._unpack_evaluation(
+                evaluator(expert_id, item)
+            )
+            decision = self._direction_decision(
+                item, alignment, current_loss
+            )
+            if decision is not None:
+                item.capability_evolution = decision.category
+                if decision.category == "harmful_drift":
+                    stats["harmful_drift"] += 1
+                elif decision.category == "beneficial_or_neutral_evolution":
+                    stats["beneficial_evolution"] += 1
+            effective_alignment = (
+                alignment if self.version_awareness_enabled else 1.0
+            )
+            item.last_observed_alignment = alignment
+            item.last_alignment = effective_alignment
+            item.recent_prediction_loss = current_loss
             item.age = max(0, int(timestamp) - item.timestamp)
+            low_alignment = (
+                self.version_awareness_enabled
+                and effective_alignment < self.alignment_threshold
+            )
+            if self.directional_recovery_enabled:
+                item.recovery_eligible = bool(
+                    low_alignment
+                    and decision is not None
+                    and decision.category == "harmful_drift"
+                )
+            else:
+                item.recovery_eligible = True
             item.refresh_credit()
-            if item.last_alignment < self.alignment_threshold:
-                demotions.append((expert_id, item))
+            if not low_alignment:
+                continue
+            if (
+                self.directional_recovery_enabled
+                and not item.recovery_eligible
+            ):
+                stats["recovery_skipped_non_degraded"] += 1
+                if self._maybe_rebase(item, current_sketch):
+                    stats["capability_rebase"] += 1
+                continue
+            demotions.append((expert_id, item))
 
-        # Remove first, then migrate.  If Recovery rejects the item, it is
+        # Remove first, then migrate. If Recovery rejects the item, it is
         # evicted rather than incorrectly remaining in Stable.
         for expert_id, item in demotions:
             removed = self.stable_buffers[expert_id].remove(item.sample_id)
@@ -350,22 +562,49 @@ class ExpertMemoryManager:
                 continue
             if not self.recovery_buffers[expert_id].contains(item.sample_id):
                 continue
-            alignment, prediction_loss = evaluator(expert_id, item)
-            item.last_alignment = float(alignment)
-            item.recent_prediction_loss = float(prediction_loss)
+            alignment, current_loss, current_sketch = self._unpack_evaluation(
+                evaluator(expert_id, item)
+            )
+            decision = self._direction_decision(
+                item, alignment, current_loss
+            )
+            if decision is not None:
+                item.capability_evolution = decision.category
+                if decision.category == "harmful_drift":
+                    stats["harmful_drift"] += 1
+                elif decision.category == "beneficial_or_neutral_evolution":
+                    stats["beneficial_evolution"] += 1
+            effective_alignment = (
+                alignment if self.version_awareness_enabled else 1.0
+            )
+            item.last_observed_alignment = alignment
+            item.last_alignment = effective_alignment
+            item.recent_prediction_loss = current_loss
             item.age = max(0, int(timestamp) - item.timestamp)
             if count_recovery_attempts:
                 item.recovery_attempts += 1
+
+            performance_recovered = bool(
+                self.directional_recovery_enabled
+                and decision is not None
+                and not decision.degraded
+            )
+            alignment_recovered = bool(
+                effective_alignment >= self.promote_alignment_threshold
+                and current_loss <= self.promote_loss_threshold
+            )
+            item.recovery_eligible = not performance_recovered
             item.refresh_credit()
-            if (
-                item.last_alignment >= self.promote_alignment_threshold
-                and item.recent_prediction_loss <= self.promote_loss_threshold
-            ):
+            if performance_recovered or alignment_recovered:
                 removed = self.recovery_buffers[expert_id].remove(
                     item.sample_id
                 )
                 if removed is None:
                     continue
+                if performance_recovered:
+                    stats["performance_recovery"] += 1
+                    if self._maybe_rebase(removed, current_sketch):
+                        stats["capability_rebase"] += 1
                 if self.stable_buffers[expert_id].add(removed):
                     stats["recovery_to_stable"] += 1
                 else:
@@ -414,11 +653,14 @@ class ExpertMemoryManager:
         sample_id: int,
         alignment: float,
         prediction_loss: float,
+        current_sketch: Optional[torch.Tensor] = None,
     ) -> Literal[
         "recovery",
         "promoted",
+        "promoted_performance",
         "dropped",
         "dropped_after_recovery",
+        "dropped_after_performance_recovery",
         "missing",
     ]:
         """Apply one post-update Recovery result and lifecycle transition."""
@@ -429,23 +671,52 @@ class ExpertMemoryManager:
         item = buffer.get(sample_id)
         if item is None:
             return "missing"
-        values = torch.tensor([alignment, prediction_loss], dtype=torch.float64)
+        values = torch.tensor(
+            [alignment, prediction_loss], dtype=torch.float64
+        )
         if not bool(torch.isfinite(values).all().item()):
             raise FloatingPointError("Recovery result contains NaN or Inf")
+        current_loss = float(prediction_loss)
+        decision = self._direction_decision(
+            item, float(alignment), current_loss
+        )
+        effective_alignment = (
+            float(alignment) if self.version_awareness_enabled else 1.0
+        )
         item.recovery_attempts += 1
-        item.last_alignment = float(alignment)
-        item.recent_prediction_loss = float(prediction_loss)
-        item.refresh_credit()
-        if (
+        item.last_observed_alignment = float(alignment)
+        item.last_alignment = effective_alignment
+        item.recent_prediction_loss = current_loss
+        if decision is not None:
+            item.capability_evolution = decision.category
+        performance_recovered = bool(
+            self.directional_recovery_enabled
+            and decision is not None
+            and not decision.degraded
+        )
+        alignment_recovered = bool(
             item.last_alignment >= self.promote_alignment_threshold
             and item.recent_prediction_loss <= self.promote_loss_threshold
-        ):
+        )
+        item.recovery_eligible = not performance_recovered
+        item.refresh_credit()
+        if performance_recovered or alignment_recovered:
             removed = buffer.remove(sample_id)
             if removed is None:
                 return "missing"
+            if performance_recovered:
+                self._maybe_rebase(removed, current_sketch)
             if self.stable_buffers[expert_id].add(removed):
-                return "promoted"
-            return "dropped_after_recovery"
+                return (
+                    "promoted_performance"
+                    if performance_recovered
+                    else "promoted"
+                )
+            return (
+                "dropped_after_performance_recovery"
+                if performance_recovered
+                else "dropped_after_recovery"
+            )
         if item.recovery_attempts >= self.max_recovery_attempts:
             buffer.remove(sample_id)
             return "dropped"
