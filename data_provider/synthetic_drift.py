@@ -52,6 +52,10 @@ class SyntheticDriftDataset(Dataset):
         shock_duration: int | None = None,
         drift_channels: Sequence[int] | None = None,
         label_len: int = 0,
+        regime_separation: float = 1.0,
+        a1_length: int | None = None,
+        b_length: int | None = None,
+        a2_length: int | None = None,
     ) -> None:
         if seq_len <= 0 or pred_len <= 0 or channels <= 0:
             raise ValueError("seq_len, pred_len, and channels must be positive")
@@ -61,6 +65,10 @@ class SyntheticDriftDataset(Dataset):
             raise ValueError("label_len must be in [0, seq_len]")
         if not np.isfinite(noise_std) or noise_std < 0.0:
             raise ValueError("noise_std must be finite and non-negative")
+        if not np.isfinite(regime_separation) or regime_separation < 0.0:
+            raise ValueError(
+                "regime_separation must be finite and non-negative"
+            )
         drift_type = str(drift_type).lower()
         if drift_type not in _DRIFT_TYPES:
             raise ValueError(f"drift_type must be one of {sorted(_DRIFT_TYPES)}")
@@ -73,6 +81,27 @@ class SyntheticDriftDataset(Dataset):
         self.noise_std = float(noise_std)
         self.drift_type = drift_type
         self.label_len = int(label_len)
+        self.regime_separation = float(regime_separation)
+        recurring_lengths = (a1_length, b_length, a2_length)
+        if any(value is not None for value in recurring_lengths):
+            if self.drift_type != "recurring":
+                raise ValueError(
+                    "explicit A1/B/A2 lengths require drift_type='recurring'"
+                )
+            if not all(value is not None for value in recurring_lengths):
+                raise ValueError(
+                    "a1_length, b_length, and a2_length must be set together"
+                )
+            lengths = tuple(int(value) for value in recurring_lengths)
+            if any(value <= 0 for value in lengths):
+                raise ValueError("recurring regime lengths must be positive")
+            if sum(lengths) != self.total_length:
+                raise ValueError(
+                    "A1/B/A2 lengths must sum to total_length"
+                )
+            self.recurring_lengths = lengths
+        else:
+            self.recurring_lengths = None
         selected = (
             tuple(range(self.channels))
             if drift_channels is None
@@ -90,6 +119,7 @@ class SyntheticDriftDataset(Dataset):
         self.regime_id = regime_id
         self.events = tuple(events)
         self.intervals = intervals
+        self.regime_parameters = self._build_regime_parameters()
         self.series = self._generate_series(alpha, shock_mask)
         self.time_marks = self._time_marks(self.total_length)
         self.metadata = {
@@ -100,15 +130,25 @@ class SyntheticDriftDataset(Dataset):
             "total_length": self.total_length,
             "seed": self.seed,
             "noise_std": self.noise_std,
+            "regime_separation": self.regime_separation,
+            "recurring_lengths": (
+                list(self.recurring_lengths)
+                if self.recurring_lengths is not None
+                else None
+            ),
             "drift_channels": list(self.drift_channels),
             "events": [event.to_dict() for event in self.events],
             "intervals": {
                 name: [int(bounds[0]), int(bounds[1])]
                 for name, bounds in self.intervals.items()
             },
+            "regime_parameters": self.regime_parameters,
             "mechanisms": {
                 "A": "positive AR(1), daily sinusoid, weak positive mixing",
-                "B": "negative AR(1), faster sinusoid, signed channel mixing",
+                "B": (
+                    "separation-controlled AR, frequency, phase, trend, "
+                    "and channel mixing"
+                ),
                 "shock": "temporary level and innovation-amplitude shift",
             },
         }
@@ -177,8 +217,13 @@ class SyntheticDriftDataset(Dataset):
             }
             events.append(self._event("A_to_B", "gradual", start, end, "A", "B"))
         elif self.drift_type == "recurring":
-            first_end = length // 3
-            second_end = 2 * length // 3
+            if self.recurring_lengths is None:
+                first_end = length // 3
+                second_end = 2 * length // 3
+            else:
+                a1_length, b_length, _ = self.recurring_lengths
+                first_end = a1_length
+                second_end = a1_length + b_length
             alpha[first_end:second_end] = 1.0
             regime[first_end:second_end] = 1
             intervals = {
@@ -226,41 +271,98 @@ class SyntheticDriftDataset(Dataset):
             )
         return alpha, regime, events, intervals, shock_mask
 
+    def _build_regime_parameters(self) -> dict[str, dict[str, object]]:
+        channels = self.channels
+        separation = self.regime_separation
+        phases_a = np.linspace(
+            0.0, np.pi / 2.0, channels, endpoint=True
+        )
+        phases_b_target = phases_a[::-1]
+        identity = np.eye(channels)
+        neighbor = np.roll(identity, 1, axis=1)
+        mixing_a = 0.85 * identity + 0.15 * neighbor
+        mixing_b_target = 0.65 * identity - 0.35 * neighbor
+        a = {
+            "ar_coefficient": 0.72,
+            "seasonal_amplitude": 0.32,
+            "seasonal_frequency": 1.0 / 24.0,
+            "trend_coefficient": 0.08,
+            "innovation_std": 0.16,
+            "phase_offsets": phases_a.tolist(),
+            "mixing_matrix": mixing_a.tolist(),
+        }
+        b = {
+            "ar_coefficient": 0.72 + separation * (-0.28 - 0.72),
+            "seasonal_amplitude": 0.32 + separation * (0.62 - 0.32),
+            "seasonal_frequency": (
+                1.0 / 24.0
+                + separation * (1.0 / 9.0 - 1.0 / 24.0)
+            ),
+            "trend_coefficient": 0.08 + separation * (-0.18 - 0.08),
+            "innovation_std": 0.16,
+            "phase_offsets": (
+                phases_a + separation * (phases_b_target - phases_a)
+            ).tolist(),
+            "mixing_matrix": (
+                mixing_a + separation * (mixing_b_target - mixing_a)
+            ).tolist(),
+        }
+        # A2 is deliberately an exact parameter copy of A1. Only observation
+        # noise differs as the stream advances.
+        return {"A1": dict(a), "B": b, "A2": dict(a)}
+
     def _generate_series(
         self, alpha: np.ndarray, shock_mask: np.ndarray
     ) -> np.ndarray:
         rng = np.random.default_rng(self.seed)
         length, channels = self.total_length, self.channels
-        innovation_a = rng.normal(0.0, 0.16, size=(length, channels))
-        innovation_b = rng.normal(0.0, 0.16, size=(length, channels))
+        params_a = self.regime_parameters["A1"]
+        params_b = self.regime_parameters["B"]
+        innovation_a = rng.normal(
+            0.0, params_a["innovation_std"], size=(length, channels)
+        )
+        innovation_b = rng.normal(
+            0.0, params_b["innovation_std"], size=(length, channels)
+        )
         state_a = np.zeros((length, channels), dtype=np.float64)
         state_b = np.zeros((length, channels), dtype=np.float64)
-        phases = np.linspace(0.0, np.pi / 2.0, channels, endpoint=True)
         time = np.arange(length, dtype=np.float64)
-        seasonal_a = np.sin(2.0 * np.pi * time[:, None] / 24.0 + phases)
-        seasonal_b = np.sin(2.0 * np.pi * time[:, None] / 9.0 + phases[::-1])
-        trend = (time[:, None] / max(1.0, length - 1.0) - 0.5)
+        phases_a = np.asarray(params_a["phase_offsets"], dtype=np.float64)
+        phases_b = np.asarray(params_b["phase_offsets"], dtype=np.float64)
+        seasonal_a = np.sin(
+            2.0
+            * np.pi
+            * params_a["seasonal_frequency"]
+            * time[:, None]
+            + phases_a
+        )
+        seasonal_b = np.sin(
+            2.0
+            * np.pi
+            * params_b["seasonal_frequency"]
+            * time[:, None]
+            + phases_b
+        )
+        trend = time[:, None] / max(1.0, length - 1.0) - 0.5
 
         for timestamp in range(length):
             previous_a = state_a[timestamp - 1] if timestamp else 0.0
             previous_b = state_b[timestamp - 1] if timestamp else 0.0
             state_a[timestamp] = (
-                0.72 * previous_a
-                + 0.32 * seasonal_a[timestamp]
-                + 0.08 * trend[timestamp]
+                params_a["ar_coefficient"] * previous_a
+                + params_a["seasonal_amplitude"] * seasonal_a[timestamp]
+                + params_a["trend_coefficient"] * trend[timestamp]
                 + innovation_a[timestamp]
             )
             state_b[timestamp] = (
-                -0.28 * previous_b
-                + 0.62 * seasonal_b[timestamp]
-                - 0.18 * trend[timestamp]
+                params_b["ar_coefficient"] * previous_b
+                + params_b["seasonal_amplitude"] * seasonal_b[timestamp]
+                + params_b["trend_coefficient"] * trend[timestamp]
                 + innovation_b[timestamp]
             )
 
-        identity = np.eye(channels)
-        neighbor = np.roll(identity, 1, axis=1)
-        mixing_a = 0.85 * identity + 0.15 * neighbor
-        mixing_b = 0.65 * identity - 0.35 * neighbor
+        mixing_a = np.asarray(params_a["mixing_matrix"], dtype=np.float64)
+        mixing_b = np.asarray(params_b["mixing_matrix"], dtype=np.float64)
         process_a = state_a @ mixing_a.T
         process_b = state_b @ mixing_b.T
         values = process_a.copy()
@@ -324,6 +426,18 @@ class SyntheticDriftDataset(Dataset):
     def target_regime_at(self, index: int) -> int:
         self._validate_index(index)
         return int(self.regime_id[index + self.seq_len])
+
+    def target_phase_at(self, index: int) -> str:
+        # Analysis-only A1/B/A2 phase; never consumed by update logic.
+        self._validate_index(index)
+        timestamp = index + self.seq_len
+        if self.drift_type != "recurring":
+            return str(self.target_regime_at(index))
+        if timestamp < self.intervals["first_A"][1]:
+            return "A1"
+        if timestamp < self.intervals["B"][1]:
+            return "B"
+        return "A2"
 
     def _validate_index(self, index: int) -> None:
         if not 0 <= int(index) < len(self):

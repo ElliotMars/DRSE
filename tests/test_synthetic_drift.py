@@ -8,6 +8,7 @@ from utils.drift_metrics import (
     MemoryTimelineRecorder,
     compute_drift_metrics,
     recovery_time,
+    sustained_recovery_time,
 )
 from utils.expert_memory import ExpertMemoryManager, VersionedMemoryItem
 
@@ -182,3 +183,97 @@ def test_metric_and_memory_recorders_reset_cleanly() -> None:
     assert recorder.arrays()["stable_occupancy"].shape == (0, 1)
     assert recorder.summary()["num_steps"] == 0
     assert all(value == 0 for value in recorder.transitions.values())
+
+
+def test_recurring_A1_and_A2_share_exact_parameters() -> None:
+    dataset = SyntheticDriftDataset(
+        seq_len=6,
+        pred_len=2,
+        channels=3,
+        total_length=75,
+        seed=7,
+        drift_type="recurring",
+        regime_separation=1.0,
+        a1_length=20,
+        b_length=30,
+        a2_length=25,
+    )
+
+    assert dataset.regime_parameters["A1"] == dataset.regime_parameters["A2"]
+    assert dataset.regime_parameters["B"] != dataset.regime_parameters["A1"]
+    assert dataset.intervals == {
+        "first_A": (0, 20),
+        "B": (20, 50),
+        "recurring_A": (50, 75),
+    }
+    assert dataset.metadata["regime_parameters"]["A1"] == (
+        dataset.metadata["regime_parameters"]["A2"]
+    )
+
+
+def test_regime_separation_controls_B_but_not_recurring_A() -> None:
+    weak = SyntheticDriftDataset(
+        seq_len=6,
+        pred_len=2,
+        channels=2,
+        total_length=60,
+        drift_type="recurring",
+        regime_separation=0.5,
+    )
+    strong = SyntheticDriftDataset(
+        seq_len=6,
+        pred_len=2,
+        channels=2,
+        total_length=60,
+        drift_type="recurring",
+        regime_separation=1.0,
+    )
+
+    assert weak.regime_parameters["A1"] == strong.regime_parameters["A1"]
+    assert weak.regime_parameters["A2"] == strong.regime_parameters["A2"]
+    assert weak.regime_parameters["B"] != strong.regime_parameters["B"]
+
+
+def test_sustained_reacquisition_and_recurring_metrics() -> None:
+    values = [
+        2.0, 1.0, 1.0, 1.0, 1.0,
+        3.0, 2.0, 1.5, 1.2, 1.0,
+        4.0, 1.0, 1.0, 1.0, 1.0,
+    ]
+    assert sustained_recovery_time(
+        values,
+        drift_origin=10,
+        reference_error=1.0,
+        rolling_window=2,
+        recovery_tolerance=0.0,
+        hold_steps=2,
+        search_end=15,
+    ) == 2
+
+    metrics = compute_drift_metrics(
+        values,
+        [
+            {"name": "A_to_B", "kind": "recurring", "origin": 5},
+            {"name": "B_to_A", "kind": "recurring", "origin": 10},
+        ],
+        pre_window=2,
+        early_window=2,
+        recovery_window=2,
+        recovery_tolerance=0.0,
+        recovery_hold_steps=2,
+        recurring_intervals={
+            "first_A": (0, 5),
+            "B": (5, 10),
+            "recurring_A": (10, 15),
+        },
+        seq_len=0,
+    )
+    recurring = metrics["recurring_mode"]
+    assert recurring["A1_reference_mse"] == pytest.approx(1.0)
+    assert recurring["B_early_mse"] == pytest.approx(2.5)
+    assert recurring["B_late_mse"] == pytest.approx(1.1)
+    assert recurring["A2_early_mse"] == pytest.approx(2.5)
+    assert recurring["A2_late_mse"] == pytest.approx(1.0)
+    assert recurring["normalized_recurring_degradation"] == pytest.approx(2.5)
+    assert recurring["reacquisition_time"] == 2
+    assert recurring["cumulative_excess_error"] == pytest.approx(3.0)

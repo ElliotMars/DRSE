@@ -21,6 +21,7 @@ from utils.drift_metrics import (
     DriftMetricTracker,
     MemoryTimelineRecorder,
     compute_drift_metrics,
+    rolling_mean,
 )
 from utils.expert_memory import (
     ExpertMemoryManager,
@@ -48,6 +49,10 @@ class SyntheticBenchmarkConfig:
     transition_window: int | None = None
     shock_duration: int | None = None
     drift_type: str = "recurring"
+    regime_separation: float = 1.0
+    a1_length: int | None = None
+    b_length: int | None = None
+    a2_length: int | None = None
     drift_channels: tuple[int, ...] | None = None
     num_experts: int = 3
     strategy: str = "hybrid"
@@ -55,6 +60,8 @@ class SyntheticBenchmarkConfig:
     router_lr: float = 0.05
     recovery_window: int = 4
     recovery_tolerance: float = 0.2
+    recovery_hold_steps: int = 2
+    rolling_window: int = 8
     early_window: int = 8
     pre_window: int = 16
     stable_capacity: int = 16
@@ -76,6 +83,20 @@ class SyntheticBenchmarkConfig:
             raise ValueError("online learning rates must be positive")
         if self.memory_refresh_interval <= 0:
             raise ValueError("memory_refresh_interval must be positive")
+        if self.recovery_hold_steps <= 0 or self.rolling_window <= 0:
+            raise ValueError(
+                "recovery_hold_steps and rolling_window must be positive"
+            )
+        lengths = (self.a1_length, self.b_length, self.a2_length)
+        if any(value is not None for value in lengths):
+            if not all(value is not None for value in lengths):
+                raise ValueError(
+                    "a1_length, b_length, and a2_length must be set together"
+                )
+            if sum(int(value) for value in lengths) != self.total_length:
+                raise ValueError(
+                    "A1/B/A2 lengths must sum to total_length"
+                )
 
 
 @dataclass
@@ -91,6 +112,11 @@ class SyntheticBenchmarkResult:
     memory_diagnostics: dict[str, Any]
     event_metadata: dict[str, Any]
     memory_arrays: dict[str, np.ndarray]
+    regime_diagnostics: dict[str, Any]
+    origin: np.ndarray
+    origin_regime_id: np.ndarray
+    origin_phase: np.ndarray
+    rolling_mse: np.ndarray
     completed_records: int
     protocol_trace: tuple[tuple[int, str], ...]
 
@@ -113,6 +139,10 @@ class SyntheticProgressiveBenchmark:
             shock_duration=config.shock_duration,
             drift_type=config.drift_type,
             drift_channels=config.drift_channels,
+            regime_separation=config.regime_separation,
+            a1_length=config.a1_length,
+            b_length=config.b_length,
+            a2_length=config.a2_length,
         )
         experts, channels = config.num_experts, config.channels
         identity = torch.eye(channels).unsqueeze(0).repeat(experts, 1, 1)
@@ -369,12 +399,64 @@ class SyntheticProgressiveBenchmark:
             capability_evolution=capability_evolution,
         )
 
+    @staticmethod
+    def _empty_update_stats() -> dict[str, int]:
+        return {
+            "retained": 0,
+            "low_alignment": 0,
+            "harmful_drift": 0,
+            "beneficial_evolution": 0,
+            "capability_rebase": 0,
+            "stable_to_recovery": 0,
+            "recovery_admission": 0,
+            "recovery_attempt": 0,
+            "performance_recovery": 0,
+            "recovery_to_stable": 0,
+            "recovery_failed": 0,
+            "recovery_attempt_exhausted": 0,
+            "recovery_dropped_after_success": 0,
+            "recovery_skipped_non_degraded": 0,
+            "matured_records": 0,
+        }
+
+    @staticmethod
+    def _merge_update_stats(
+        destination: dict[str, int], source: dict[str, int]
+    ) -> None:
+        for key in destination:
+            destination[key] += int(source.get(key, 0))
+
+    def _candidate_stats(
+        self, candidate: VersionedMemoryItem
+    ) -> dict[str, int]:
+        stats = self._empty_update_stats()
+        stats["matured_records"] = 1
+        low_alignment = bool(
+            self.memory.version_awareness_enabled
+            and candidate.last_observed_alignment
+            < self.memory.alignment_threshold
+        )
+        stats["low_alignment"] = int(low_alignment)
+        stats["retained"] = int(not low_alignment)
+        if candidate.capability_evolution == "harmful_drift":
+            stats["harmful_drift"] = 1
+        elif (
+            candidate.capability_evolution
+            == "beneficial_or_neutral_evolution"
+        ):
+            stats["beneficial_evolution"] = 1
+            if low_alignment and self.memory.direction_awareness_enabled:
+                stats["capability_rebase"] = 1
+                stats["recovery_skipped_non_degraded"] = 1
+        return stats
+
     def _update_experts(
         self, record: ProgressiveForecastRecord, timestamp: int
     ) -> dict[str, int]:
         candidate = self._candidate_for_record(record, timestamp)
+        stats = self._candidate_stats(candidate)
         replay_items: list[tuple[int, VersionedMemoryItem]] = []
-        if not self.config.disable_recovery:
+        if self.memory.recovery_enabled:
             excluded: set[int] = set()
             for expert_id in range(self.config.num_experts):
                 replay_items.extend(
@@ -383,13 +465,18 @@ class SyntheticProgressiveBenchmark:
                         expert_id, 1, excluded_sample_ids=excluded
                     )
                 )
+        stats["recovery_attempt"] += len(replay_items)
 
         self.expert_optimizer.zero_grad(set_to_none=True)
         prediction = self._forecast_experts(record.x.float()[0])
         loss = (prediction - record.matured_targets.unsqueeze(-1)).pow(2).mean()
         for expert_id, item in replay_items:
-            replay_prediction = self._forecast_experts(item.x.float()[0])[..., expert_id]
-            loss = loss + 0.1 * (replay_prediction - item.target.float()[0]).pow(2).mean()
+            replay_prediction = self._forecast_experts(
+                item.x.float()[0]
+            )[..., expert_id]
+            loss = loss + 0.1 * (
+                replay_prediction - item.target.float()[0]
+            ).pow(2).mean()
         loss.backward()
         raw_weight = self.expert_weight.grad.detach().clone()
         raw_bias = self.expert_bias.grad.detach().clone()
@@ -403,16 +490,13 @@ class SyntheticProgressiveBenchmark:
         self.previous_gradients = (raw_weight, raw_bias)
         self.expert_weight.grad.copy_(filtered_weight)
         self.expert_bias.grad.copy_(filtered_bias)
-        torch.nn.utils.clip_grad_norm_([self.expert_weight, self.expert_bias], 5.0)
+        torch.nn.utils.clip_grad_norm_(
+            [self.expert_weight, self.expert_bias], 5.0
+        )
         self.expert_optimizer.step()
 
-        stats = {
-            "stable_to_recovery": 0,
-            "recovery_to_stable": 0,
-            "recovery_dropped_after_success": 0,
-            "recovery_attempt_exhausted": 0,
-        }
         for expert_id, item in replay_items:
+            original_prediction_loss = item.prediction_time_loss
             alignment, replay_loss, current_sketch = self._memory_evaluator(
                 expert_id, item
             )
@@ -423,26 +507,68 @@ class SyntheticProgressiveBenchmark:
                 replay_loss,
                 current_sketch=current_sketch,
             )
-            if status == "promoted":
+            if (
+                self.memory.version_awareness_enabled
+                and alignment < self.memory.alignment_threshold
+            ):
+                stats["low_alignment"] += 1
+            else:
+                stats["retained"] += 1
+            if item.capability_evolution == "harmful_drift":
+                stats["harmful_drift"] += 1
+            elif (
+                item.capability_evolution
+                == "beneficial_or_neutral_evolution"
+            ):
+                stats["beneficial_evolution"] += 1
+            if item.prediction_time_loss != original_prediction_loss:
+                raise RuntimeError("prediction_time_loss changed during rebase")
+            if status == "promoted_performance":
+                stats["performance_recovery"] += 1
+                stats["capability_rebase"] += 1
                 stats["recovery_to_stable"] += 1
+            elif status == "promoted":
+                stats["recovery_to_stable"] += 1
+            elif status == "dropped_after_performance_recovery":
+                stats["performance_recovery"] += 1
+                stats["capability_rebase"] += 1
+                stats["recovery_dropped_after_success"] += 1
             elif status == "dropped_after_recovery":
                 stats["recovery_dropped_after_success"] += 1
             elif status == "dropped":
+                stats["recovery_failed"] += 1
                 stats["recovery_attempt_exhausted"] += 1
+            elif status == "recovery":
+                stats["recovery_failed"] += 1
 
-        self.memory.add_candidate(candidate)
+        kind, admission = self.memory.add_candidate_with_result(candidate)
+        if kind == "recovery" and admission.accepted:
+            stats["recovery_admission"] += 1
         self.sample_regimes[record.origin] = self.dataset.target_regime_at(
             record.origin
         )
         self.completed_records += 1
         if self.completed_records % self.config.memory_refresh_interval == 0:
+            def tracked_evaluator(
+                expert_id: int, item: VersionedMemoryItem
+            ) -> tuple[float, float, torch.Tensor]:
+                evaluation = self._memory_evaluator(expert_id, item)
+                alignment = evaluation[0]
+                if (
+                    self.memory.version_awareness_enabled
+                    and alignment < self.memory.alignment_threshold
+                ):
+                    stats["low_alignment"] += 1
+                else:
+                    stats["retained"] += 1
+                return evaluation
+
             refresh = self.memory.refresh(
-                self._memory_evaluator,
+                tracked_evaluator,
                 timestamp=timestamp,
                 count_recovery_attempts=False,
             )
-            for key in stats:
-                stats[key] += int(refresh.get(key, 0))
+            self._merge_update_stats(stats, refresh)
         return stats
 
     def _predict_record(self, origin: int) -> tuple[ProgressiveForecastRecord, torch.Tensor]:
@@ -471,6 +597,80 @@ class SyntheticProgressiveBenchmark:
             capability_sketch=sketch,
         )
         return record, mixture
+
+    def _regime_diagnostics(
+        self,
+        mse: np.ndarray,
+        phases: np.ndarray,
+        memory_arrays: dict[str, np.ndarray],
+    ) -> dict[str, Any]:
+        diagnostics: dict[str, Any] = {
+            "rate_definition": "raw events / matured records",
+            "events_per_1000_definition": (
+                "1000 * raw events / matured records"
+            ),
+            "regimes": {},
+        }
+        event_names = (
+            "harmful_drift",
+            "beneficial_evolution",
+            "stable_to_recovery",
+            "recovery_admission",
+            "recovery_attempt",
+            "performance_recovery",
+            "recovery_to_stable",
+            "recovery_failed",
+            "recovery_attempt_exhausted",
+            "recovery_dropped_after_success",
+            "recovery_skipped_non_degraded",
+            "capability_rebase",
+        )
+        stable_size = memory_arrays["stable_occupancy"].sum(axis=1)
+        recovery_size = memory_arrays["recovery_occupancy"].sum(axis=1)
+        matured_events = memory_arrays["matured_records_events"]
+        for phase in ("A1", "B", "A2"):
+            mask = phases == phase
+            indices = np.flatnonzero(mask)
+            matured = int(matured_events[mask].sum())
+            phase_result: dict[str, Any] = {
+                "origin_start": (
+                    int(indices[0]) if indices.size else None
+                ),
+                "origin_end": (
+                    int(indices[-1] + 1) if indices.size else None
+                ),
+                "num_origins": int(indices.size),
+                "matured_records": matured,
+                "mean_mse": (
+                    float(mse[mask].mean()) if indices.size else None
+                ),
+                "mean_stable_occupancy": (
+                    float(stable_size[mask].mean())
+                    if indices.size
+                    else None
+                ),
+                "mean_recovery_occupancy": (
+                    float(recovery_size[mask].mean())
+                    if indices.size
+                    else None
+                ),
+                "events": {},
+            }
+            for name in event_names:
+                count = int(memory_arrays[f"{name}_events"][mask].sum())
+                phase_result["events"][name] = {
+                    "count": count,
+                    "rate": (
+                        float(count / matured) if matured else None
+                    ),
+                    "events_per_1000_matured_records": (
+                        float(1000.0 * count / matured)
+                        if matured
+                        else None
+                    ),
+                }
+            diagnostics["regimes"][phase] = phase_result
+        return diagnostics
 
     def run(self, output_directory: str | None = None) -> SyntheticBenchmarkResult:
         self.reset()
@@ -523,21 +723,48 @@ class SyntheticProgressiveBenchmark:
             early_window=self.config.early_window,
             recovery_window=self.config.recovery_window,
             recovery_tolerance=self.config.recovery_tolerance,
+            recovery_hold_steps=self.config.recovery_hold_steps,
             recurring_intervals=self.dataset.intervals,
             seq_len=self.config.seq_len,
         )
+        mse_timeline = np.asarray(
+            self.metric_tracker.mse, dtype=np.float64
+        )
+        memory_arrays = self.memory_recorder.arrays()
+        origins = np.arange(len(self.dataset), dtype=np.int64)
+        origin_regime_id = np.asarray(
+            [self.dataset.target_regime_at(i) for i in origins],
+            dtype=np.int64,
+        )
+        origin_phase = np.asarray(
+            [self.dataset.target_phase_at(i) for i in origins],
+            dtype="<U2",
+        )
+        rolling_mse = rolling_mean(
+            mse_timeline, self.config.rolling_window
+        )
+        regime_diagnostics = self._regime_diagnostics(
+            mse_timeline, origin_phase, memory_arrays
+        )
+        memory_diagnostics = self.memory_recorder.summary()
+        memory_diagnostics["regime_diagnostics"] = regime_diagnostics
         result = SyntheticBenchmarkResult(
             predictions=np.asarray(predictions, dtype=np.float32),
             targets=np.asarray(targets, dtype=np.float32),
-            mse_timeline=np.asarray(self.metric_tracker.mse, dtype=np.float64),
+            mse_timeline=mse_timeline,
             horizon_mse_timeline=np.asarray(horizon_mse, dtype=np.float64),
             series=self.dataset.series.copy(),
             regime_id=self.dataset.regime_id.copy(),
             transition_alpha=self.dataset.transition_alpha.copy(),
             drift_metrics=metrics,
-            memory_diagnostics=self.memory_recorder.summary(),
+            memory_diagnostics=memory_diagnostics,
             event_metadata=dict(self.dataset.metadata),
-            memory_arrays=self.memory_recorder.arrays(),
+            memory_arrays=memory_arrays,
+            regime_diagnostics=regime_diagnostics,
+            origin=origins,
+            origin_regime_id=origin_regime_id,
+            origin_phase=origin_phase,
+            rolling_mse=rolling_mse,
             completed_records=self.completed_records,
             protocol_trace=tuple(self.protocol_trace),
         )
@@ -569,12 +796,51 @@ class SyntheticProgressiveBenchmark:
             encoding="utf-8",
         ) as handle:
             json.dump(result.memory_diagnostics, handle, indent=2, ensure_ascii=False)
+        with open(
+            os.path.join(directory, "regime_diagnostics.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(result.regime_diagnostics, handle, indent=2, ensure_ascii=False)
         np.savez_compressed(
             os.path.join(directory, "synthetic_timeline.npz"),
             series=result.series,
             regime_id=result.regime_id,
             transition_alpha=result.transition_alpha,
             **result.memory_arrays,
+        )
+        np.savez_compressed(
+            os.path.join(directory, "timeline.npz"),
+            origin=result.origin,
+            regime_id=result.origin_regime_id,
+            phase=result.origin_phase,
+            mse=result.mse_timeline,
+            rolling_mse=result.rolling_mse,
+            stable_size=result.memory_arrays["stable_occupancy"].sum(axis=1),
+            recovery_size=result.memory_arrays[
+                "recovery_occupancy"
+            ].sum(axis=1),
+            harmful_drift_events=result.memory_arrays[
+                "harmful_drift_events"
+            ],
+            beneficial_evolution_events=result.memory_arrays[
+                "beneficial_evolution_events"
+            ],
+            capability_rebase_events=result.memory_arrays[
+                "capability_rebase_events"
+            ],
+            stable_to_recovery_events=result.memory_arrays[
+                "stable_to_recovery_events"
+            ],
+            recovery_admission_events=result.memory_arrays[
+                "recovery_admission_events"
+            ],
+            recovery_attempt_events=result.memory_arrays[
+                "recovery_attempt_events"
+            ],
+            recovery_to_stable_events=result.memory_arrays[
+                "recovery_to_stable_events"
+            ],
         )
 
 
@@ -591,12 +857,18 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--total_length", type=int, default=120)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--noise_std", type=float, default=0.05)
+    parser.add_argument("--regime_separation", type=float, default=1.0)
+    parser.add_argument("--a1_length", type=int, default=None)
+    parser.add_argument("--b_length", type=int, default=None)
+    parser.add_argument("--a2_length", type=int, default=None)
     parser.add_argument("--transition_window", type=int, default=None)
     parser.add_argument("--shock_duration", type=int, default=None)
     parser.add_argument("--num_experts", type=int, default=3)
     parser.add_argument("--synthetic_drift_channels", default="")
     parser.add_argument("--recovery_window", type=int, default=4)
     parser.add_argument("--recovery_tolerance", type=float, default=0.2)
+    parser.add_argument("--recovery_hold_steps", type=int, default=2)
+    parser.add_argument("--rolling_window", type=int, default=8)
     parser.add_argument("--disable_recovery", action="store_true")
     parser.add_argument("--disable_directional_recovery", action="store_true")
     parser.add_argument("--disable_version_awareness", action="store_true")
@@ -604,29 +876,14 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    arguments = _parser().parse_args()
-    config = SyntheticBenchmarkConfig(
-        seq_len=arguments.seq_len,
-        pred_len=arguments.pred_len,
-        channels=arguments.channels,
-        total_length=arguments.total_length,
-        seed=arguments.seed,
-        noise_std=arguments.noise_std,
-        transition_window=arguments.transition_window,
-        shock_duration=arguments.shock_duration,
-        drift_type=arguments.drift_type,
-        drift_channels=parse_drift_channels(arguments.synthetic_drift_channels),
-        num_experts=arguments.num_experts,
-        strategy=arguments.strategy,
-        recovery_window=arguments.recovery_window,
-        recovery_tolerance=arguments.recovery_tolerance,
-        disable_recovery=arguments.disable_recovery,
-        disable_directional_recovery=arguments.disable_directional_recovery,
-        disable_version_awareness=arguments.disable_version_awareness,
-        disable_z_correction=arguments.disable_z_correction,
-    )
-    variant_tags = [config.drift_type, config.strategy, f"seed{config.seed}"]
+def result_directory(
+    output_root: str, config: SyntheticBenchmarkConfig
+) -> str:
+    variant_tags = [
+        config.drift_type,
+        config.strategy,
+        f"seed{config.seed}",
+    ]
     if config.disable_recovery:
         variant_tags.append("no_recovery")
     if config.disable_directional_recovery:
@@ -635,7 +892,46 @@ def main() -> None:
         variant_tags.append("no_version")
     if config.disable_z_correction:
         variant_tags.append("no_z")
-    output = os.path.join(arguments.output_dir, "_".join(variant_tags))
+    return os.path.join(output_root, "_".join(variant_tags))
+
+
+def main() -> None:
+    arguments = _parser().parse_args()
+    explicit_lengths = (
+        arguments.a1_length,
+        arguments.b_length,
+        arguments.a2_length,
+    )
+    total_length = arguments.total_length
+    if all(value is not None for value in explicit_lengths):
+        total_length = sum(int(value) for value in explicit_lengths)
+    config = SyntheticBenchmarkConfig(
+        seq_len=arguments.seq_len,
+        pred_len=arguments.pred_len,
+        channels=arguments.channels,
+        total_length=total_length,
+        seed=arguments.seed,
+        noise_std=arguments.noise_std,
+        regime_separation=arguments.regime_separation,
+        a1_length=arguments.a1_length,
+        b_length=arguments.b_length,
+        a2_length=arguments.a2_length,
+        transition_window=arguments.transition_window,
+        shock_duration=arguments.shock_duration,
+        drift_type=arguments.drift_type,
+        drift_channels=parse_drift_channels(arguments.synthetic_drift_channels),
+        num_experts=arguments.num_experts,
+        strategy=arguments.strategy,
+        recovery_window=arguments.recovery_window,
+        recovery_tolerance=arguments.recovery_tolerance,
+        recovery_hold_steps=arguments.recovery_hold_steps,
+        rolling_window=arguments.rolling_window,
+        disable_recovery=arguments.disable_recovery,
+        disable_directional_recovery=arguments.disable_directional_recovery,
+        disable_version_awareness=arguments.disable_version_awareness,
+        disable_z_correction=arguments.disable_z_correction,
+    )
+    output = result_directory(arguments.output_dir, config)
     result = SyntheticProgressiveBenchmark(config).run(output)
     print(
         json.dumps(

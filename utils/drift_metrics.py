@@ -15,6 +15,24 @@ _TRANSITION_KEYS = (
     "recovery_attempt_exhausted",
 )
 
+_DIAGNOSTIC_KEYS = (
+    "retained",
+    "low_alignment",
+    "harmful_drift",
+    "beneficial_evolution",
+    "capability_rebase",
+    "stable_to_recovery",
+    "recovery_admission",
+    "recovery_attempt",
+    "performance_recovery",
+    "recovery_to_stable",
+    "recovery_failed",
+    "recovery_attempt_exhausted",
+    "recovery_dropped_after_success",
+    "recovery_skipped_non_degraded",
+    "matured_records",
+)
+
 
 def _event_dict(event: Any) -> dict[str, Any]:
     if isinstance(event, Mapping):
@@ -59,6 +77,54 @@ def recovery_time(
     return None
 
 
+def rolling_mean(
+    values: Sequence[float], window: int
+) -> np.ndarray:
+    # Trailing rolling mean aligned to the input timeline.
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    if window <= 0:
+        raise ValueError("rolling window must be positive")
+    result = np.full(array.shape, np.nan, dtype=np.float64)
+    if array.size < window:
+        return result
+    cumulative = np.concatenate(([0.0], np.cumsum(array)))
+    result[window - 1 :] = (
+        cumulative[window:] - cumulative[:-window]
+    ) / float(window)
+    return result
+
+
+def sustained_recovery_time(
+    mse_timeline: Sequence[float],
+    *,
+    drift_origin: int,
+    reference_error: float,
+    rolling_window: int,
+    recovery_tolerance: float,
+    hold_steps: int,
+    search_end: int | None = None,
+) -> int | None:
+    # First A2 offset whose rolling MSE stays recovered for hold_steps.
+    values = np.asarray(mse_timeline, dtype=np.float64).reshape(-1)
+    if hold_steps <= 0:
+        raise ValueError("hold_steps must be positive")
+    if recovery_tolerance < 0.0 or not np.isfinite(recovery_tolerance):
+        raise ValueError("recovery_tolerance must be finite and non-negative")
+    if not np.isfinite(reference_error) or reference_error < 0.0:
+        raise ValueError("reference_error must be finite and non-negative")
+    start = max(0, int(drift_origin))
+    end = len(values) if search_end is None else min(len(values), int(search_end))
+    local = values[start:end]
+    rolled = rolling_mean(local, rolling_window)
+    threshold = float(reference_error) * (1.0 + float(recovery_tolerance))
+    recovered = np.isfinite(rolled) & (rolled <= threshold)
+    last_start = recovered.size - int(hold_steps)
+    for candidate in range(0, last_start + 1):
+        if bool(recovered[candidate : candidate + hold_steps].all()):
+            return candidate
+    return None
+
+
 def compute_drift_metrics(
     mse_timeline: Sequence[float],
     events: Sequence[Any],
@@ -67,6 +133,7 @@ def compute_drift_metrics(
     early_window: int = 8,
     recovery_window: int = 4,
     recovery_tolerance: float = 0.2,
+    recovery_hold_steps: int = 1,
     recurring_intervals: Mapping[str, Sequence[int]] | None = None,
     seq_len: int = 0,
 ) -> dict[str, Any]:
@@ -77,6 +144,8 @@ def compute_drift_metrics(
         raise ValueError("mse_timeline must contain finite non-negative values")
     if pre_window <= 0 or early_window <= 0:
         raise ValueError("pre_window and early_window must be positive")
+    if recovery_hold_steps <= 0:
+        raise ValueError("recovery_hold_steps must be positive")
     event_dicts = [_event_dict(event) for event in events]
     event_results: list[dict[str, Any]] = []
     for index, event in enumerate(event_dicts):
@@ -122,6 +191,7 @@ def compute_drift_metrics(
             "early_window": int(early_window),
             "recovery_window": int(recovery_window),
             "recovery_tolerance": float(recovery_tolerance),
+            "recovery_hold_steps": int(recovery_hold_steps),
             "no_recovery_sentinel": None,
         },
         "events": event_results,
@@ -136,31 +206,45 @@ def compute_drift_metrics(
             for name, bounds in recurring_intervals.items()
         }
         first_start, first_end = origin_intervals["first_A"]
+        b_start, b_end = origin_intervals["B"]
         recurring_start, recurring_end = origin_intervals["recurring_A"]
+        first_start = min(first_start, len(values))
         first_end = min(first_end, len(values))
+        b_start = min(b_start, len(values))
+        b_end = min(b_end, len(values))
         recurring_start = min(recurring_start, len(values))
         recurring_end = min(recurring_end, len(values))
-        first_error = _mean_or_none(values[first_start:first_end])
-        recurring_early = _mean_or_none(
-            values[recurring_start : min(recurring_end, recurring_start + early_window)]
-        )
+
+        first_values = values[first_start:first_end]
+        b_values = values[b_start:b_end]
+        recurring_values = values[recurring_start:recurring_end]
+        first_error = _mean_or_none(first_values)
+        reference_error = _mean_or_none(first_values[-pre_window:])
+        b_early = _mean_or_none(b_values[:early_window])
+        b_late = _mean_or_none(b_values[-early_window:])
+        recurring_early = _mean_or_none(recurring_values[:early_window])
+        recurring_late = _mean_or_none(recurring_values[-early_window:])
         reacquisition = (
-            recovery_time(
+            sustained_recovery_time(
                 values,
                 drift_origin=recurring_start,
-                pre_drift_error=first_error,
-                recovery_window=recovery_window,
+                reference_error=reference_error,
+                rolling_window=recovery_window,
                 recovery_tolerance=recovery_tolerance,
+                hold_steps=recovery_hold_steps,
                 search_end=recurring_end,
             )
-            if first_error is not None
+            if reference_error is not None
             else None
         )
         recovered_error = None
         if reacquisition is not None:
             recovered_start = recurring_start + reacquisition
             recovered_error = _mean_or_none(
-                values[recovered_start : recovered_start + recovery_window]
+                values[
+                    recovered_start
+                    : min(recurring_end, recovered_start + recovery_window)
+                ]
             )
         retention_ratio = (
             recurring_early / first_error
@@ -169,11 +253,34 @@ def compute_drift_metrics(
             and recurring_early is not None
             else None
         )
+        normalized_degradation = (
+            recurring_early / (reference_error + 1e-12)
+            if reference_error is not None and recurring_early is not None
+            else None
+        )
+        cumulative_excess = (
+            float(
+                np.maximum(recurring_values - reference_error, 0.0).sum()
+            )
+            if reference_error is not None
+            else None
+        )
         result["recurring_mode"] = {
+            "origin_intervals": {
+                name: [int(bounds[0]), int(bounds[1])]
+                for name, bounds in origin_intervals.items()
+            },
             "first_A_error": first_error,
             "recurring_A_early_error": recurring_early,
             "recurring_A_recovered_error": recovered_error,
+            "A1_reference_mse": reference_error,
+            "B_early_mse": b_early,
+            "B_late_mse": b_late,
+            "A2_early_mse": recurring_early,
+            "A2_late_mse": recurring_late,
+            "normalized_recurring_degradation": normalized_degradation,
             "reacquisition_time": reacquisition,
+            "cumulative_excess_error": cumulative_excess,
             "old_mode_retention_error_ratio": retention_ratio,
             "old_mode_retention_definition": (
                 "recurring_A_early_error / first_A_error; 1 is perfect retention"
@@ -215,6 +322,8 @@ class MemoryTimelineRecorder:
         self.stable_regime_occupancy: list[dict[int, int]] = []
         self.recovery_regime_occupancy: list[dict[int, int]] = []
         self.transitions = {key: 0 for key in _TRANSITION_KEYS}
+        self.diagnostic_counts = {key: 0 for key in _DIAGNOSTIC_KEYS}
+        self.event_counts = {key: [] for key in _DIAGNOSTIC_KEYS}
 
     def record(
         self,
@@ -253,9 +362,13 @@ class MemoryTimelineRecorder:
                     destination[regime] = destination.get(regime, 0) + 1
         self.stable_regime_occupancy.append(stable_counts)
         self.recovery_regime_occupancy.append(recovery_counts)
-        if transition_stats is not None:
-            for key in _TRANSITION_KEYS:
-                self.transitions[key] += int(transition_stats.get(key, 0))
+        stats = transition_stats or {}
+        for key in _TRANSITION_KEYS:
+            self.transitions[key] += int(stats.get(key, 0))
+        for key in _DIAGNOSTIC_KEYS:
+            value = int(stats.get(key, 0))
+            self.diagnostic_counts[key] += value
+            self.event_counts[key].append(value)
 
     def arrays(self) -> dict[str, np.ndarray]:
         regime_labels = sorted(
@@ -297,6 +410,10 @@ class MemoryTimelineRecorder:
             "recovery_occupancy_by_regime": regime_array(
                 self.recovery_regime_occupancy
             ),
+            **{
+                f"{key}_events": np.asarray(values, dtype=np.int64)
+                for key, values in self.event_counts.items()
+            },
         }
 
     def summary(self) -> dict[str, Any]:
@@ -304,6 +421,10 @@ class MemoryTimelineRecorder:
         return {
             "num_steps": len(self.steps),
             "transitions": dict(self.transitions),
+            "diagnostic_counts": {
+                f"{key}_count": int(value)
+                for key, value in self.diagnostic_counts.items()
+            },
             "mean_recovery_attempts_definition": (
                 "mean attempts among current Recovery items, averaged over origins"
             ),
