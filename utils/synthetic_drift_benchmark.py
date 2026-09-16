@@ -22,7 +22,11 @@ from utils.drift_metrics import (
     MemoryTimelineRecorder,
     compute_drift_metrics,
 )
-from utils.expert_memory import ExpertMemoryManager, VersionedMemoryItem
+from utils.expert_memory import (
+    ExpertMemoryManager,
+    VersionedMemoryItem,
+    classify_capability_evolution,
+)
 from utils.online_routing import OnlineRoutingCorrection
 from utils.progressive_feedback import (
     ProgressiveFeedbackManager,
@@ -58,6 +62,7 @@ class SyntheticBenchmarkConfig:
     max_recovery_attempts: int = 4
     memory_refresh_interval: int = 2
     disable_recovery: bool = False
+    disable_directional_recovery: bool = False
     disable_version_awareness: bool = False
     disable_z_correction: bool = False
 
@@ -156,6 +161,17 @@ class SyntheticProgressiveBenchmark:
             storage_dtype="fp32",
             promote_alignment_threshold=0.99,
             promote_loss_threshold=1.5,
+            version_awareness_enabled=not config.disable_version_awareness,
+            directional_recovery_enabled=(
+                not config.disable_directional_recovery
+                and not config.disable_version_awareness
+            ),
+            recovery_enabled=not config.disable_recovery,
+            capability_rebase_enabled=(
+                not config.disable_directional_recovery
+                and not config.disable_version_awareness
+            ),
+            recovery_degradation_margin=0.0,
         )
         self.metric_tracker = DriftMetricTracker()
         self.memory_recorder = MemoryTimelineRecorder(experts)
@@ -279,12 +295,12 @@ class SyntheticProgressiveBenchmark:
 
     def _memory_evaluator(
         self, expert_id: int, item: VersionedMemoryItem
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, torch.Tensor]:
         alignment = self._alignment(item.normalized_sketch, expert_id)
         prediction = self._forecast_experts(item.x.float()[0])[..., expert_id]
         target = item.target.float()[0]
         loss = float((prediction - target).pow(2).mean().item())
-        return alignment, loss
+        return alignment, loss, self._capability_sketch()[expert_id]
 
     def _candidate_for_record(
         self, record: ProgressiveForecastRecord, timestamp: int
@@ -292,8 +308,44 @@ class SyntheticProgressiveBenchmark:
         owner = int(record.sample_responsibility.argmax().item())
         alignment = self._alignment(record.capability_sketch[owner], owner)
         current = self._forecast_experts(record.x.float()[0])[..., owner]
-        loss = float((current - record.matured_targets).pow(2).mean().item())
+        current_loss = float(
+            (current - record.matured_targets).pow(2).mean().item()
+        )
+        prediction_time_loss = float(
+            (
+                record.expert_predictions[..., owner]
+                - record.matured_targets
+            ).pow(2).mean().item()
+        )
         responsibility = float(record.sample_responsibility[owner].item())
+        reference_sketch = record.capability_sketch[owner]
+        reference_loss = prediction_time_loss
+        admission_alignment = alignment
+        recovery_eligible = not self.config.disable_recovery
+        capability_evolution = "retained"
+        if self.memory.direction_awareness_enabled:
+            decision = classify_capability_evolution(
+                alignment=alignment,
+                prediction_loss=prediction_time_loss,
+                current_loss=current_loss,
+                alignment_threshold=self.memory.alignment_threshold,
+                degradation_margin=0.0,
+            )
+            capability_evolution = decision.category
+            low_alignment = alignment < self.memory.alignment_threshold
+            recovery_eligible = bool(
+                not self.config.disable_recovery
+                and low_alignment
+                and decision.category == "harmful_drift"
+            )
+            if (
+                low_alignment
+                and decision.category
+                == "beneficial_or_neutral_evolution"
+            ):
+                reference_sketch = self._capability_sketch()[owner]
+                reference_loss = current_loss
+                admission_alignment = 1.0
         return VersionedMemoryItem(
             sample_id=record.origin,
             origin=record.origin,
@@ -302,14 +354,19 @@ class SyntheticProgressiveBenchmark:
             x_mark=record.x_mark,
             target=record.matured_targets.unsqueeze(0),
             prediction_capability_sketch=record.capability_sketch[owner],
-            normalized_sketch=record.capability_sketch[owner],
+            normalized_sketch=reference_sketch,
             sample_responsibility=responsibility,
             sample_confidence=float(record.sample_confidence),
-            last_alignment=alignment,
-            stable_credit=responsibility * alignment,
-            recovery_credit=responsibility * (1.0 - alignment),
+            last_alignment=admission_alignment,
+            stable_credit=responsibility * admission_alignment,
+            recovery_credit=responsibility * (1.0 - admission_alignment),
             timestamp=timestamp,
-            recent_prediction_loss=loss,
+            recent_prediction_loss=current_loss,
+            prediction_time_loss=prediction_time_loss,
+            reference_capability_loss=reference_loss,
+            last_observed_alignment=alignment,
+            recovery_eligible=recovery_eligible,
+            capability_evolution=capability_evolution,
         )
 
     def _update_experts(
@@ -356,9 +413,15 @@ class SyntheticProgressiveBenchmark:
             "recovery_attempt_exhausted": 0,
         }
         for expert_id, item in replay_items:
-            alignment, replay_loss = self._memory_evaluator(expert_id, item)
+            alignment, replay_loss, current_sketch = self._memory_evaluator(
+                expert_id, item
+            )
             status = self.memory.update_recovery_result(
-                expert_id, item.sample_id, alignment, replay_loss
+                expert_id,
+                item.sample_id,
+                alignment,
+                replay_loss,
+                current_sketch=current_sketch,
             )
             if status == "promoted":
                 stats["recovery_to_stable"] += 1
@@ -535,6 +598,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--recovery_window", type=int, default=4)
     parser.add_argument("--recovery_tolerance", type=float, default=0.2)
     parser.add_argument("--disable_recovery", action="store_true")
+    parser.add_argument("--disable_directional_recovery", action="store_true")
     parser.add_argument("--disable_version_awareness", action="store_true")
     parser.add_argument("--disable_z_correction", action="store_true")
     return parser
@@ -558,12 +622,15 @@ def main() -> None:
         recovery_window=arguments.recovery_window,
         recovery_tolerance=arguments.recovery_tolerance,
         disable_recovery=arguments.disable_recovery,
+        disable_directional_recovery=arguments.disable_directional_recovery,
         disable_version_awareness=arguments.disable_version_awareness,
         disable_z_correction=arguments.disable_z_correction,
     )
     variant_tags = [config.drift_type, config.strategy, f"seed{config.seed}"]
     if config.disable_recovery:
         variant_tags.append("no_recovery")
+    if config.disable_directional_recovery:
+        variant_tags.append("no_direction")
     if config.disable_version_awareness:
         variant_tags.append("no_version")
     if config.disable_z_correction:

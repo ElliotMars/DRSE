@@ -1,11 +1,13 @@
 import json
 
 import numpy as np
+import torch
 
 from utils.synthetic_drift_benchmark import (
     SyntheticBenchmarkConfig,
     SyntheticProgressiveBenchmark,
 )
+from utils.progressive_feedback import ProgressiveForecastRecord
 
 
 
@@ -95,3 +97,142 @@ def test_recovery_disabled_has_zero_recovery_occupancy() -> None:
     result = SyntheticProgressiveBenchmark(config).run()
 
     assert not result.memory_arrays["recovery_occupancy"].any()
+    assert all(
+        value == 0
+        for value in result.memory_diagnostics["transitions"].values()
+    )
+
+
+def _completed_record(
+    benchmark: SyntheticProgressiveBenchmark,
+    prediction_loss: float,
+) -> ProgressiveForecastRecord:
+    experts = benchmark.config.num_experts
+    horizon = benchmark.config.pred_len
+    channels = benchmark.config.channels
+    prediction = torch.full(
+        (horizon, channels, experts), prediction_loss ** 0.5
+    )
+    record = ProgressiveForecastRecord(
+        origin=0,
+        x=torch.zeros(1, benchmark.config.seq_len, channels),
+        x_mark=torch.zeros(1, benchmark.config.seq_len, 7),
+        expert_predictions=prediction,
+        router_prior=torch.full(
+            (horizon, channels, experts), 1.0 / experts
+        ),
+        router_weights=torch.full(
+            (horizon, channels, experts), 1.0 / experts
+        ),
+        mixture_prediction=prediction.mean(dim=-1),
+        capability_sketch=benchmark._capability_sketch(),
+    )
+    record.matured_targets.zero_()
+    record.matured_mask.fill_(True)
+    record.num_matured = horizon
+    record.sample_responsibility.zero_()
+    record.sample_responsibility[0] = 1.0
+    record.sample_confidence = 1.0
+    return record
+
+
+def _force_low_alignment(benchmark: SyntheticProgressiveBenchmark) -> None:
+    with torch.no_grad():
+        benchmark.expert_weight[0].mul_(-1.0)
+        benchmark.expert_bias[0].add_(0.5)
+
+
+def test_recurring_benchmark_defaults_to_direction_awareness() -> None:
+    benchmark = SyntheticProgressiveBenchmark(
+        SyntheticBenchmarkConfig(drift_type="recurring")
+    )
+
+    assert benchmark.memory.version_awareness_enabled
+    assert benchmark.memory.direction_awareness_enabled
+    assert benchmark.memory.capability_rebase_enabled
+
+
+def test_no_direction_restores_alignment_only_recovery() -> None:
+    benchmark = SyntheticProgressiveBenchmark(
+        SyntheticBenchmarkConfig(
+            disable_directional_recovery=True,
+            pred_len=1,
+            channels=2,
+            num_experts=2,
+        )
+    )
+    record = _completed_record(benchmark, prediction_loss=100.0)
+    _force_low_alignment(benchmark)
+    candidate = benchmark._candidate_for_record(record, timestamp=1)
+
+    assert not benchmark.memory.direction_awareness_enabled
+    assert not benchmark.memory.capability_rebase_enabled
+    assert candidate.last_alignment < benchmark.memory.alignment_threshold
+    assert benchmark.memory.add_candidate(candidate) == "recovery"
+
+
+def test_beneficial_evolution_rebases_to_stable() -> None:
+    benchmark = SyntheticProgressiveBenchmark(
+        SyntheticBenchmarkConfig(pred_len=1, channels=2, num_experts=2)
+    )
+    record = _completed_record(benchmark, prediction_loss=100.0)
+    original_sketch = record.capability_sketch[0].clone()
+    _force_low_alignment(benchmark)
+    candidate = benchmark._candidate_for_record(record, timestamp=1)
+
+    assert candidate.capability_evolution == "beneficial_or_neutral_evolution"
+    assert candidate.prediction_time_loss == 100.0
+    assert candidate.reference_capability_loss < candidate.prediction_time_loss
+    assert torch.allclose(
+        candidate.prediction_capability_sketch, original_sketch
+    )
+    assert not torch.allclose(candidate.normalized_sketch, original_sketch)
+    assert benchmark.memory.add_candidate(candidate) == "stable"
+
+
+def test_only_harmful_drift_enters_recovery() -> None:
+    benchmark = SyntheticProgressiveBenchmark(
+        SyntheticBenchmarkConfig(pred_len=1, channels=2, num_experts=2)
+    )
+    record = _completed_record(benchmark, prediction_loss=0.0)
+    prediction_sketch = record.capability_sketch[0].clone()
+    _force_low_alignment(benchmark)
+    candidate = benchmark._candidate_for_record(record, timestamp=1)
+
+    assert candidate.capability_evolution == "harmful_drift"
+    assert candidate.recovery_eligible
+    assert candidate.prediction_time_loss == 0.0
+    assert candidate.reference_capability_loss == 0.0
+    assert torch.allclose(
+        candidate.prediction_capability_sketch, prediction_sketch
+    )
+    assert benchmark.memory.add_candidate(candidate) == "recovery"
+
+
+def test_no_recovery_keeps_direction_classification_without_lifecycle() -> None:
+    benchmark = SyntheticProgressiveBenchmark(
+        SyntheticBenchmarkConfig(
+            pred_len=1,
+            channels=2,
+            num_experts=2,
+            disable_recovery=True,
+        )
+    )
+    record = _completed_record(benchmark, prediction_loss=0.0)
+    _force_low_alignment(benchmark)
+    harmful = benchmark._candidate_for_record(record, timestamp=1)
+
+    assert benchmark.memory.direction_awareness_enabled
+    assert harmful.capability_evolution == "harmful_drift"
+    assert not harmful.recovery_eligible
+    assert benchmark.memory.add_candidate(harmful) is None
+    assert all(not buffer.items for buffer in benchmark.memory.recovery_buffers)
+
+    benchmark.reset()
+    record = _completed_record(benchmark, prediction_loss=100.0)
+    _force_low_alignment(benchmark)
+    beneficial = benchmark._candidate_for_record(record, timestamp=1)
+
+    assert beneficial.capability_evolution == "beneficial_or_neutral_evolution"
+    assert benchmark.memory.add_candidate(beneficial) == "stable"
+    assert all(not buffer.items for buffer in benchmark.memory.recovery_buffers)

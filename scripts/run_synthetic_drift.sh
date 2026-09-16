@@ -30,6 +30,9 @@ fi
 if [[ "${DISABLE_RECOVERY:-0}" == "1" ]]; then
     optional_args+=(--disable_recovery)
 fi
+if [[ "${DISABLE_DIRECTIONAL_RECOVERY:-0}" == "1" ]]; then
+    optional_args+=(--disable_directional_recovery)
+fi
 if [[ "${DISABLE_VERSION_AWARENESS:-0}" == "1" ]]; then
     optional_args+=(--disable_version_awareness)
 fi
