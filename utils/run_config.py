@@ -241,17 +241,9 @@ def build_run_config(
     tsb_enabled = (
         online_enabled and effective_strategy in {"tsb", "hybrid"}
     )
-    direction_awareness_enabled = bool(
-        online_enabled
-        and not getattr(args, "disable_directional_recovery", False)
-        and not getattr(args, "disable_version_awareness", False)
-    )
     config.update(
         {
             "causal_feedback_protocol": protocol,
-            "online_correction_enabled": online_enabled and not bool(
-                getattr(args, "disable_online_correction", False)
-            ),
             "effective_expert_update_strategy": effective_strategy,
             "tsb_enabled": tsb_enabled,
             "tsb_smoothing_enabled": tsb_enabled
@@ -260,24 +252,35 @@ def build_run_config(
             and not bool(
                 getattr(args, "disable_tsb_conflict_filter", False)
             ),
-            "recovery_enabled": online_enabled and not bool(
-                getattr(args, "disable_recovery", False)
-            ),
-            "direction_awareness_enabled": direction_awareness_enabled,
-            "directional_recovery_enabled": (
-                direction_awareness_enabled
-            ),
-            "capability_rebase_enabled": (
-                direction_awareness_enabled
-            ),
-            "capability_reference_loss_enabled": (
-                direction_awareness_enabled
-            ),
-            "credit_weighted_subspace": not bool(
-                getattr(args, "disable_credit_weighted_subspace", False)
-            ),
         }
     )
+
+    is_pace = str(getattr(args, "method", "")).lower() == "multi_expert"
+    if is_pace:
+        direction_awareness_enabled = bool(
+            online_enabled
+            and not getattr(args, "disable_directional_recovery", False)
+            and not getattr(args, "disable_version_awareness", False)
+        )
+        config.update(
+            {
+                "online_correction_enabled": online_enabled and not bool(
+                    getattr(args, "disable_online_correction", False)
+                ),
+                "recovery_enabled": online_enabled and not bool(
+                    getattr(args, "disable_recovery", False)
+                ),
+                "direction_awareness_enabled": direction_awareness_enabled,
+                "directional_recovery_enabled": direction_awareness_enabled,
+                "capability_rebase_enabled": direction_awareness_enabled,
+                "capability_reference_loss_enabled": (
+                    direction_awareness_enabled
+                ),
+                "credit_weighted_subspace": not bool(
+                    getattr(args, "disable_credit_weighted_subspace", False)
+                ),
+            }
+        )
     if protocol == "progressive_baseline_control":
         config["feedback_protocol"] = protocol
     if iteration_index is not None:

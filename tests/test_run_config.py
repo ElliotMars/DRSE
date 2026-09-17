@@ -17,8 +17,9 @@ def _args(**overrides):
     values = {
         "online_learning": "full",
         "progressive_fb": True,
+        "progressive_baseline_fb": False,
         "delay_fb": False,
-        "method": "onenet_fsnet",
+        "method": "multi_expert",
         "data": "ETTh2",
         "data_path": Path("ETTh2.csv"),
         "seq_len": 60,
@@ -77,6 +78,64 @@ def _args(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+PACE_ONLY_DERIVED_FIELDS = {
+    "online_correction_enabled",
+    "recovery_enabled",
+    "direction_awareness_enabled",
+    "directional_recovery_enabled",
+    "capability_rebase_enabled",
+    "capability_reference_loss_enabled",
+    "credit_weighted_subspace",
+}
+
+
+def _progressive_baseline_args(method: str):
+    return _args(
+        method=method,
+        progressive_fb=False,
+        progressive_baseline_fb=True,
+        delay_fb=False,
+    )
+
+
+def test_pace_derived_metadata_is_unchanged() -> None:
+    config = build_run_config(_args(method="multi_expert"))
+
+    assert config["online_correction_enabled"] is True
+    assert config["recovery_enabled"] is True
+    assert config["direction_awareness_enabled"] is True
+    assert config["directional_recovery_enabled"] is True
+    assert config["capability_rebase_enabled"] is True
+    assert config["capability_reference_loss_enabled"] is True
+    assert config["credit_weighted_subspace"] is True
+
+
+@pytest.mark.parametrize("method", ["fsnet", "onenet", "dyname"])
+def test_progressive_baseline_omits_pace_only_derived_metadata(method) -> None:
+    config = build_run_config(_progressive_baseline_args(method))
+
+    assert config["method"] == method
+    assert config["feedback_protocol"] == "progressive_baseline_control"
+    assert config["progressive_baseline_fb"] is True
+    assert PACE_ONLY_DERIVED_FIELDS.isdisjoint(config)
+
+
+def test_native_baseline_omits_pace_only_derived_metadata() -> None:
+    config = build_run_config(
+        _args(
+            method="fsnet",
+            progressive_fb=False,
+            progressive_baseline_fb=False,
+            delay_fb=True,
+        )
+    )
+
+    assert config["causal_feedback_protocol"] == "legacy_delayed"
+    assert "feedback_protocol" not in config
+    assert "progressive_baseline_fb" not in config
+    assert PACE_ONLY_DERIVED_FIELDS.isdisjoint(config)
 
 
 def test_noncausal_online_protocol_fails_fast() -> None:
@@ -181,7 +240,7 @@ def test_run_config_json_round_trip_preserves_scalar_types(
     assert isinstance(loaded["pred_len"], int)
     assert loaded["online_lr_expert"] == 1e-4
     assert isinstance(loaded["online_lr_expert"], float)
-    assert loaded["method"] == "onenet_fsnet"
+    assert loaded["method"] == "multi_expert"
     assert loaded["git_commit"] is None
 
 
