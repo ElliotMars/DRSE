@@ -2,6 +2,7 @@ import os
 import random
 import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -20,6 +21,12 @@ from models.onenet import OneNetForecaster
 from models.proceed import ProceedForecaster
 from models.patchtst_dgrad import PatchTSTDGrad
 from utils.metrics import cumavg, metric
+from utils.progressive_baseline_feedback import (
+    ProgressiveBaselineDiagnostics,
+    ProgressiveBaselineFeedbackManager,
+    ProgressiveBaselineRecord,
+    progressive_partial_mse,
+)
 from utils.tools import EarlyStopping, adjust_learning_rate
 
 
@@ -42,6 +49,10 @@ class ExpStreamBaseline(Exp_Basic):
         self.buffer = deque(maxlen=args.replay_buffer_size)
         self.opt = self.opt_student = None
         self.prev_student = None
+        self.progressive_baseline_fb = bool(
+            getattr(args, "progressive_baseline_fb", False)
+        )
+        self.progressive_protocol_diagnostics = None
 
     def _get_data(self, flag):
         mapping = defaultdict(lambda: Dataset_Custom, {
@@ -74,6 +85,33 @@ class ExpStreamBaseline(Exp_Basic):
     def _store_grad(self):
         if hasattr(self.model, "store_grad"):
             self.model.store_grad()
+
+    @contextmanager
+    def _fsnet_state_updates(self, enabled):
+        modules = [
+            module
+            for module in self.model.modules()
+            if hasattr(module, "state_updates_enabled")
+        ]
+        previous = [module.state_updates_enabled for module in modules]
+        try:
+            for module in modules:
+                module.state_updates_enabled = enabled
+            yield
+        finally:
+            for module, old_value in zip(modules, previous):
+                module.state_updates_enabled = old_value
+
+    def _current_observation(self, x):
+        f_dim = -1 if self.args.features == "MS" else 0
+        observation = x.float()[:, -1, f_dim:].reshape(-1)
+        if tuple(observation.shape) != (self.args.c_out,):
+            raise ValueError(
+                "observable target has shape {}, expected {}".format(
+                    tuple(observation.shape), (self.args.c_out,)
+                )
+            )
+        return observation
 
     def train(self, setting):
         _, train_loader = self._get_data("train"); _, val_loader = self._get_data("val")
@@ -137,6 +175,69 @@ class ExpStreamBaseline(Exp_Basic):
             loss.backward(); self.opt.step(); self._store_grad()
         self.buffer.append((x.detach().clone(),y.detach().clone(),mark.detach().clone()))
 
+    def _progressive_feedback_update(self, events):
+        if not events:
+            return None
+        historical_x = torch.cat(
+            [event.record.x for event in events], dim=0
+        ).float().to(self.device)
+        historical_mark = torch.cat(
+            [event.record.x_mark for event in events], dim=0
+        ).float().to(self.device)
+        horizon_indices = torch.tensor(
+            [event.horizon_index for event in events],
+            dtype=torch.long,
+            device=self.device,
+        )
+        targets = torch.stack(
+            [event.target for event in events], dim=0
+        ).float().to(self.device)
+
+        self.model.train()
+        self.opt.zero_grad()
+        # Historical replay reads the FSNet fast/slow state but must not advance
+        # it once per pending record. The current-origin prediction below remains
+        # the sole state-mutating forward, matching the native stream semantics.
+        with self._fsnet_state_updates(False):
+            predictions = self._forward(historical_x, historical_mark)
+            loss = progressive_partial_mse(
+                predictions, horizon_indices, targets
+            )
+        loss.backward()
+        self.opt.step()
+        self._store_grad()
+        self.progressive_protocol_diagnostics.optimizer_step()
+        return loss.detach()
+
+    def _progressive_online_batch(self, manager, x, y, mark):
+        batch_preds, batch_trues = [], []
+        for i in range(x.shape[0]):
+            origin = self.progressive_protocol_diagnostics.total_origins
+            current_x = x[i : i + 1]
+            current_mark = mark[i : i + 1]
+            observation = self._current_observation(current_x)
+            events = manager.release(origin, observation)
+            self.progressive_protocol_diagnostics.begin_origin(origin, events)
+            self._progressive_feedback_update(events)
+
+            self.model.eval()
+            with torch.no_grad():
+                prediction = self._forward(current_x, current_mark)
+            record = ProgressiveBaselineRecord(
+                origin=origin,
+                x=current_x,
+                x_mark=current_mark,
+                method=self.method,
+            )
+            manager.add_record(record)
+            self.progressive_protocol_diagnostics.prediction()
+            batch_preds.append(prediction)
+            # Full forecast truth is evaluation-only and is never retained by
+            # the manager or ProgressiveBaselineRecord.
+            batch_trues.append(y[i : i + 1])
+
+        return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
+
     def _delayed_online_batch(self, feedback_queue, x, y, mark):
         batch_preds, batch_trues = [], []
         for i in range(x.shape[0]):
@@ -172,12 +273,43 @@ class ExpStreamBaseline(Exp_Basic):
         if self.method == "dsof":
             self.opt_student=optim.Adam(self.student.parameters(),lr=self.args.dsof_student_lr)
         self.buffer.clear(); preds=[]; trues=[]; records=[[],[],[],[],[]]; start=time.time()
-        feedback_queue = deque() if self.args.delay_fb and self.online != "none" else None
+        progressive_manager = None
+        if self.progressive_baseline_fb and self.online != "none":
+            progressive_manager = ProgressiveBaselineFeedbackManager(
+                pred_len=self.args.pred_len, c_out=self.args.c_out
+            )
+            self.progressive_protocol_diagnostics = (
+                ProgressiveBaselineDiagnostics(self.args.pred_len)
+            )
+            print(
+                "[PROGRESSIVE_BASELINE_FB] release -> learn -> predict -> store"
+            )
+        else:
+            self.progressive_protocol_diagnostics = None
+        feedback_queue = (
+            deque()
+            if progressive_manager is None
+            and self.args.delay_fb
+            and self.online != "none"
+            else None
+        )
         if feedback_queue is not None:
             print("[DELAY_FB] rolling origins; feedback delay={} steps".format(self.args.pred_len))
+        processed_origins = 0
         for x,y,mark,_ in tqdm(loader):
+            max_steps = int(getattr(self.args, "max_online_steps", -1))
+            if max_steps > 0:
+                remaining = max_steps - processed_origins
+                if remaining <= 0:
+                    break
+                if x.shape[0] > remaining:
+                    x, y, mark = x[:remaining], y[:remaining], mark[:remaining]
             x,mark,y=x.float().to(self.device),mark.float().to(self.device),self._target(y)
-            if feedback_queue is not None:
+            if progressive_manager is not None:
+                pred, y = self._progressive_online_batch(
+                    progressive_manager, x, y, mark
+                )
+            elif feedback_queue is not None:
                 pred, y = self._delayed_online_batch(feedback_queue, x, y, mark)
             else:
                 self.model.eval()
@@ -187,12 +319,20 @@ class ExpStreamBaseline(Exp_Basic):
                     self.model.train()
                     if self.student is not None:self.student.train()
                     self._online_update(x,y,mark)
+            processed_origins += int(pred.shape[0])
             pf=rearrange(pred,"b t d -> b (t d)"); tf=rearrange(y,"b t d -> b (t d)")
             preds.append(pf.cpu());trues.append(tf.cpu())
             for arr,val in zip(records,metric(pf.cpu().numpy(),tf.cpu().numpy())):arr.append(val)
+        if progressive_manager is not None:
+            self.progressive_protocol_diagnostics.finish(len(progressive_manager))
         curves=[cumavg(x) for x in records]; vals=[x[-1] for x in curves]; elapsed=time.time()-start
         print("mse:{}, mae:{}, time:{}".format(vals[1],vals[0],elapsed))
         return vals+[elapsed],curves[0],curves[1],torch.cat(preds).numpy(),torch.cat(trues).numpy()
+
+    def save_progressive_baseline_diagnostics(self, result_directory):
+        if self.progressive_protocol_diagnostics is None:
+            raise RuntimeError("progressive baseline diagnostics are unavailable")
+        return self.progressive_protocol_diagnostics.save(result_directory)
 
 
 class ExpER(ExpStreamBaseline): method="er"

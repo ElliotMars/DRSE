@@ -14,13 +14,16 @@ from typing import Any
 VALID_ONLINE_LEARNING_MODES = frozenset({"none", "full", "regressor"})
 CAUSAL_PROTOCOL_ERROR = (
     "Causal online forecasting requires a delayed-feedback protocol. "
-    "Enable --progressive_fb or --delay_fb. Full-window immediate online "
-    "updates are non-causal under rolling-origin evaluation."
+    "Enable --progressive_fb, --progressive_baseline_fb, or --delay_fb. "
+    "Full-window immediate online updates are non-causal under "
+    "rolling-origin evaluation."
 )
+PROGRESSIVE_BASELINE_METHODS = frozenset({"fsnet", "onenet", "dyname"})
 
 PAPER_CRITICAL_FIELDS = (
     # Feedback protocol and model.
     "progressive_fb",
+    "progressive_baseline_fb",
     "delay_fb",
     "online_learning",
     "method",
@@ -129,6 +132,22 @@ def validate_online_feedback_protocol(args: Any) -> str:
     mode = _online_learning_mode(args)
     if mode == "none":
         return "none_offline"
+    progressive_baseline = bool(
+        getattr(args, "progressive_baseline_fb", False)
+    )
+    if progressive_baseline:
+        method = str(getattr(args, "method", "")).lower()
+        if bool(getattr(args, "progressive_fb", False)):
+            raise ValueError(
+                "--progressive_baseline_fb is independent of --progressive_fb"
+            )
+        if method not in PROGRESSIVE_BASELINE_METHODS:
+            supported = ", ".join(sorted(PROGRESSIVE_BASELINE_METHODS))
+            raise ValueError(
+                "--progressive_baseline_fb only supports "
+                f"{{{supported}}}, got {method!r}"
+            )
+        return "progressive_baseline_control"
     if bool(getattr(args, "progressive_fb", False)):
         return "progressive"
     if bool(getattr(args, "delay_fb", False)):
@@ -210,8 +229,12 @@ def build_run_config(
     protocol = validate_online_feedback_protocol(args)
     config: dict[str, Any] = {"schema_version": 1}
     for field in PAPER_CRITICAL_FIELDS:
-        if hasattr(args, field):
-            config[field] = _json_safe(getattr(args, field))
+        if not hasattr(args, field):
+            continue
+        value = getattr(args, field)
+        if field == "progressive_baseline_fb" and not bool(value):
+            continue
+        config[field] = _json_safe(value)
 
     effective_strategy = _effective_update_strategy(args)
     online_enabled = protocol != "none_offline"
@@ -255,6 +278,8 @@ def build_run_config(
             ),
         }
     )
+    if protocol == "progressive_baseline_control":
+        config["feedback_protocol"] = protocol
     if iteration_index is not None:
         config["iteration_index"] = int(iteration_index)
     if hasattr(args, "subspace_rank"):
@@ -294,3 +319,25 @@ def save_run_config(
         )
         handle.write("\n")
     return str(path)
+
+
+def annotate_run_config(
+    config_path: str | os.PathLike[str], metadata: dict[str, Any]
+) -> dict[str, Any]:
+    """Merge post-run scalar protocol counts into an existing run config."""
+
+    path = Path(config_path)
+    with path.open("r", encoding="utf-8") as handle:
+        config = json.load(handle)
+    config.update(_json_safe(metadata))
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            config,
+            handle,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
+        handle.write("\n")
+    return config

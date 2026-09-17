@@ -14,6 +14,11 @@ from data.data_loader import Dataset_Custom, Dataset_ETT_hour, Dataset_ETT_minut
 from exp.exp_basic import Exp_Basic
 from models.dyname import DynaME
 from utils.metrics import cumavg, metric
+from utils.progressive_baseline_feedback import (
+    ProgressiveBaselineDiagnostics,
+    ProgressiveBaselineFeedbackManager,
+    ProgressiveBaselineRecord,
+)
 from utils.tools import EarlyStopping, adjust_learning_rate
 
 
@@ -26,6 +31,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.past = None
         self.opt = None
         self.opt_gate = None
+        self.progressive_baseline_fb = bool(
+            getattr(args, "progressive_baseline_fb", False)
+        )
+        self.progressive_protocol_diagnostics = None
 
     def _get_data(self, flag):
         mapping = defaultdict(lambda: Dataset_Custom, {
@@ -51,6 +60,17 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
     def _select_criterion(self):
         return nn.MSELoss()
+
+    def _current_observation(self, x):
+        f_dim = -1 if self.args.features == "MS" else 0
+        observation = x.float()[:, -1, f_dim:].reshape(-1)
+        if tuple(observation.shape) != (self.args.c_out,):
+            raise ValueError(
+                "observable target has shape {}, expected {}".format(
+                    tuple(observation.shape), (self.args.c_out,)
+                )
+            )
+        return observation
 
     def train(self, setting):
         _, train_loader = self._get_data("train")
@@ -130,6 +150,71 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.opt_gate.step()
         self.model.update_signal(loss.item())
 
+    def _progressive_gate_update(self, events):
+        if not events:
+            return None
+        self.model.train()
+        self.opt_gate.zero_grad()
+        event_losses = []
+        for event in events:
+            record = event.record
+            rep = record.representation.to(self.device)
+            stacked = record.expert_predictions.to(self.device)
+            prediction, _, _ = self.model.combine_cached(
+                rep, stacked, blend=record.blend
+            )
+            target = event.target.float().to(self.device)
+            event_losses.append(
+                (prediction[0, event.horizon_index] - target).pow(2).mean()
+            )
+        loss = torch.stack(event_losses).mean()
+        loss.backward()
+        nn.utils.clip_grad_norm_(list(self.model.gate_parameters()), 1.0)
+        self.opt_gate.step()
+        # Native DynaME advances its dynamic weighting signal once per gate
+        # optimizer step. The progressive control preserves that frequency.
+        self.model.update_signal(loss.item())
+        self.progressive_protocol_diagnostics.optimizer_step()
+        return loss.detach()
+
+    def _progressive_online_batch(
+        self, manager, batch_x, batch_y
+    ):
+        batch_preds, batch_trues = [], []
+        for i in range(batch_x.shape[0]):
+            origin = self.progressive_protocol_diagnostics.total_origins
+            x = batch_x[i : i + 1].float().to(self.device)
+            y = self._target(batch_y[i : i + 1])
+            observation = self._current_observation(x)
+            events = manager.release(origin, observation)
+            self.progressive_protocol_diagnostics.begin_origin(origin, events)
+            self._progressive_gate_update(events)
+
+            # The current observable timestamp enters DynaME history before the
+            # current forecast, exactly as in its native delayed path.
+            self._append_observation(x)
+            self.model.eval()
+            with torch.no_grad():
+                pred, _, _, blend, rep, stacked = self.model(
+                    x, self.past, return_details=True
+                )
+            manager.add_record(
+                ProgressiveBaselineRecord(
+                    origin=origin,
+                    x=x,
+                    method="dyname",
+                    representation=rep,
+                    expert_predictions=stacked,
+                    blend=float(blend),
+                )
+            )
+            self.progressive_protocol_diagnostics.prediction()
+            batch_preds.append(rearrange(pred, "b t d -> b (t d)"))
+            # Full forecast truth remains local to offline evaluation.
+            batch_trues.append(rearrange(y, "b t d -> b (t d)"))
+
+        return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
+
     def _online_batch(self, batch_x, batch_y):
         x = batch_x.float().to(self.device)
         y = self._target(batch_y)
@@ -174,19 +259,53 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.past = None
         preds, trues, maes, mses, rmses, mapes, mspes = [], [], [], [], [], [], []
         start = time.time()
-        feedback_queue = deque() if self.args.delay_fb and self.online != "none" else None
+        progressive_manager = None
+        if self.progressive_baseline_fb and self.online != "none":
+            progressive_manager = ProgressiveBaselineFeedbackManager(
+                pred_len=self.args.pred_len, c_out=self.args.c_out
+            )
+            self.progressive_protocol_diagnostics = (
+                ProgressiveBaselineDiagnostics(self.args.pred_len)
+            )
+            print(
+                "[PROGRESSIVE_BASELINE_FB] release -> learn -> predict -> store"
+            )
+        else:
+            self.progressive_protocol_diagnostics = None
+        feedback_queue = (
+            deque()
+            if progressive_manager is None
+            and self.args.delay_fb
+            and self.online != "none"
+            else None
+        )
         if feedback_queue is not None:
             print("[DELAY_FB] rolling origins; feedback delay={} steps".format(self.args.pred_len))
+        processed_origins = 0
         for batch_x, batch_y, _, _ in tqdm(loader):
-            if feedback_queue is not None:
+            max_steps = int(getattr(self.args, "max_online_steps", -1))
+            if max_steps > 0:
+                remaining = max_steps - processed_origins
+                if remaining <= 0:
+                    break
+                if batch_x.shape[0] > remaining:
+                    batch_x, batch_y = batch_x[:remaining], batch_y[:remaining]
+            if progressive_manager is not None:
+                pred, true = self._progressive_online_batch(
+                    progressive_manager, batch_x, batch_y
+                )
+            elif feedback_queue is not None:
                 pred, true = self._delayed_online_batch(feedback_queue, batch_x, batch_y)
             else:
                 pred, true = self._online_batch(batch_x, batch_y)
+            processed_origins += int(pred.shape[0])
             preds.append(pred.detach().cpu())
             trues.append(true.detach().cpu())
             values = metric(pred.detach().cpu().numpy(), true.detach().cpu().numpy())
             for target, value in zip((maes, mses, rmses, mapes, mspes), values):
                 target.append(value)
+        if progressive_manager is not None:
+            self.progressive_protocol_diagnostics.finish(len(progressive_manager))
         pred_np = torch.cat(preds).numpy()
         true_np = torch.cat(trues).numpy()
         curves = [cumavg(x) for x in (maes, mses, rmses, mapes, mspes)]
@@ -194,3 +313,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
         elapsed = time.time() - start
         print("mse:{}, mae:{}, time:{}".format(mse, mae, elapsed))
         return [mae, mse, rmse, mape, mspe, elapsed], curves[0], curves[1], pred_np, true_np
+
+    def save_progressive_baseline_diagnostics(self, result_directory):
+        if self.progressive_protocol_diagnostics is None:
+            raise RuntimeError("progressive baseline diagnostics are unavailable")
+        return self.progressive_protocol_diagnostics.save(result_directory)

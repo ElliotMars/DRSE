@@ -6,6 +6,22 @@ import torch
 from utils.credit_assignment import compute_local_credit, compute_sample_credit
 
 
+def matured_horizon_index(
+    record_origin: int, current_origin: int, pred_len: int
+) -> Optional[int]:
+    """Return the zero-based horizon newly observable at ``current_origin``.
+
+    Rolling origin ``o`` predicts timestamps ``o + 1`` through ``o + H``.
+    Consequently, its one-based horizon ``h`` matures exactly at ``o + h``.
+    ``None`` means that this record has no target maturing at the current origin.
+    """
+
+    horizon = int(current_origin) - int(record_origin)
+    if horizon < 1 or horizon > int(pred_len):
+        return None
+    return horizon - 1
+
+
 @dataclass
 class ProgressiveForecastRecord:
     """Prediction-time snapshot whose targets are revealed one step at a time."""
@@ -197,13 +213,15 @@ class ProgressiveFeedbackManager:
         completed_origins: List[int] = []
 
         for record_origin, record in list(self._records.items()):
-            horizon = origin - record_origin
-            if horizon < 1 or horizon > self.pred_len:
+            horizon_index = matured_horizon_index(
+                record_origin, origin, self.pred_len
+            )
+            if horizon_index is None:
                 continue
-            horizon_index = horizon - 1
             if bool(record.matured_mask[horizon_index].item()):
                 raise RuntimeError(
-                    f"origin {record_origin} horizon {horizon} was released twice"
+                    f"origin {record_origin} horizon {horizon_index + 1} "
+                    "was released twice"
                 )
 
             record.matured_targets[horizon_index].copy_(

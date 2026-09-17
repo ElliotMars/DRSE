@@ -14,6 +14,7 @@ from utils.iteration_diagnostics import (
     save_prediction_results,
 )
 from utils.run_config import (
+    annotate_run_config,
     save_run_config,
     validate_online_feedback_protocol,
 )
@@ -203,6 +204,12 @@ def parse_args():
     parser.add_argument('--router_entropy_weight', type=float, default=1e-3)
     parser.add_argument('--progressive_fb', action='store_true', default=False,
                         help='release one newly matured timestamp per rolling origin')
+    parser.add_argument(
+        '--progressive_baseline_fb',
+        action='store_true',
+        default=False,
+        help='enable progressive causal feedback for FSNet/OneNet/DynaME only',
+    )
     parser.add_argument('--router_granularity', type=str, default='channel',
                         choices=['channel', 'horizon_channel'],
                         help='router weight granularity; channel preserves legacy checkpoints')
@@ -445,6 +452,8 @@ if __name__ == '__main__':
     diagnostic_summaries = []
 
     method_name = args.method
+    if args.progressive_baseline_fb:
+        method_name = '{}_progfb'.format(method_name)
     if args.checkpoint_tag:
         method_name = '{}_{}'.format(method_name, args.checkpoint_tag)
     result_setting = '{}_{}_pl{}_ol{}_opt{}_tb{}'.format(
@@ -526,6 +535,30 @@ if __name__ == '__main__':
             mae_curve,
             mse_curve,
         )
+        if (
+            args.progressive_baseline_fb
+            and hasattr(exp, 'save_progressive_baseline_diagnostics')
+        ):
+            protocol_path = exp.save_progressive_baseline_diagnostics(
+                iteration_folder
+            )
+            protocol_summary = exp.progressive_protocol_diagnostics.as_dict()
+            annotate_run_config(
+                run_config_path,
+                {
+                    'seed': iteration_seed,
+                    'optimizer_step_count': protocol_summary[
+                        'optimizer_step_count'
+                    ],
+                    'released_event_count': protocol_summary[
+                        'released_event_count'
+                    ],
+                    'pending_records_at_end': protocol_summary[
+                        'pending_records_at_end'
+                    ],
+                },
+            )
+            print('progressive baseline diagnostics:', protocol_path)
         if hasattr(exp, 'save_online_diagnostics') and args.progressive_fb:
             npz_path, json_path = exp.save_online_diagnostics(
                 iteration_folder
